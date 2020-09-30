@@ -3,10 +3,8 @@ all: libsclog.a sclog_test
 ./strace/Makefile: ./strace/Makefile.am ./strace/bootstrap ./strace/configure.ac 
 	cd ./strace && ./bootstrap && ./configure
 	
-./strace/libsclog.a: ./strace/Makefile
+libsclog.a: ./strace/Makefile
 	make -C ./strace
-
-libsclog.a: ./strace/libsclog.a
 	cp ./strace/libsclog.a ./
 
 ./sclog_test: sclog_test.c sclog.h libsclog.a
