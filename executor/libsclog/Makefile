@@ -1,13 +1,7 @@
 all: libsclog.a sclog_test
 
-./strace/configure: ./strace/bootstrap
-	cd ./strace
-	./bootstrap
-	
-./strace/Makefile: ./strace/Makefile.am ./strace/bootstrap ./strace/configure
-	cd ./strace
-	./bootstrap
-	./configure
+./strace/Makefile: ./strace/Makefile.am ./strace/bootstrap ./strace/configure.ac 
+	cd ./strace && ./bootstrap && ./configure
 	
 ./strace/libsclog.a: ./strace/Makefile
 	make -C ./strace

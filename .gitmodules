@@ -1,4 +1,4 @@
 [submodule "executor/libsclog/strace"]
 	path = executor/libsclog/strace
-	url = git@github.com:liucy1998/strace.git
+	url = https://github.com/liucy1998/strace.git
 	branch = cyliu/libsclog
