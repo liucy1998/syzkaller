@@ -124,8 +124,9 @@ ifneq ("$(NO_CROSS_COMPILER)", "")
 	$(info ************************************************************************************)
 else
 	mkdir -p ./bin/$(TARGETOS)_$(TARGETARCH)
-	$(CC) -o ./bin/$(TARGETOS)_$(TARGETARCH)/syz-executor$(EXE) executor/executor.cc \
-		$(ADDCFLAGS) $(CFLAGS) -DGOOS_$(TARGETOS)=1 -DGOARCH_$(TARGETARCH)=1 \
+	make -C executor/libsclog
+	$(CC) -o ./bin/$(TARGETOS)_$(TARGETARCH)/syz-executor$(EXE) executor/executor.cc executor/libsclog/libsclog.a -lrt\
+		$(ADDCFLAGS) $(CFLAGS) -DCONTAINER_CHECKER -DGOOS_$(TARGETOS)=1 -DGOARCH_$(TARGETARCH)=1 \
 		-DHOSTGOOS_$(HOSTOS)=1 -DGIT_REVISION=\"$(REV)\"
 endif
 endif

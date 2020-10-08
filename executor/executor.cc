@@ -17,6 +17,7 @@
 #include <unistd.h>
 
 #include "defs.h"
+#include "libsclog/sclog.h"
 
 #if defined(__GNUC__)
 #define SYSCALLAPI
@@ -344,6 +345,11 @@ static void setup_features(char** enable, int n);
 
 int main(int argc, char** argv)
 {
+#ifdef CONTAINER_CHECKER
+	char sclog_path[30];
+	snprintf(sclog_path, sizeof(sclog_path), "/tmp/trace.%llu", procid);
+	init_sclog(sclog_path);
+#endif
 	if (argc == 2 && strcmp(argv[1], "version") == 0) {
 		puts(GOOS " " GOARCH " " SYZ_REVISION " " GIT_REVISION);
 		return 0;
@@ -913,6 +919,12 @@ void handle_completion(thread_t* th)
 		}
 		fail("running = %d", running);
 	}
+#ifdef CONTAINER_CHECKER
+	// use for sorting
+	const call_t* call = &syscalls[th->call_num];
+	log_syscall_printf("%u: ", th->call_index);
+	log_syscall(call->sys_nr, th->num_args, th->args, th->res);
+#endif
 }
 
 void copyout_call_results(thread_t* th)
