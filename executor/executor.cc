@@ -922,8 +922,10 @@ void handle_completion(thread_t* th)
 #ifdef CONTAINER_CHECKER
 	// use for sorting
 	const call_t* call = &syscalls[th->call_num];
-	log_syscall_printf("%u: ", th->call_index);
-	log_syscall(call->sys_nr, th->num_args, th->args, th->res);
+	if(!call->call) {
+		// use for sorting
+		log_syscall_with_index(th->call_index, call->sys_nr, th->num_args, th->args, th->res);
+	}
 #endif
 }
 
