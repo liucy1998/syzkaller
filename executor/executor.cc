@@ -182,7 +182,8 @@ static const uint64 arg_csum_inet = 0;
 static const uint64 arg_csum_chunk_data = 0;
 static const uint64 arg_csum_chunk_const = 1;
 
-typedef intptr_t(SYSCALLAPI* syscall_t)(intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t);
+// add one more arg to pass call_index
+typedef intptr_t(SYSCALLAPI* syscall_t)(intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t, intptr_t);
 
 struct call_t {
 	const char* name;
@@ -920,7 +921,6 @@ void handle_completion(thread_t* th)
 		fail("running = %d", running);
 	}
 #ifdef CONTAINER_CHECKER
-	// use for sorting
 	const call_t* call = &syscalls[th->call_num];
 	if(!call->call) {
 		// use for sorting
@@ -1108,7 +1108,7 @@ void execute_call(thread_t* th)
 	// Arrange for res = -1 and errno = EFAULT result for such case.
 	th->res = -1;
 	errno = EFAULT;
-	NONFAILING(th->res = execute_syscall(call, th->args));
+	NONFAILING(th->res = execute_syscall(call, th->args, (intptr_t)th->call_index));
 	th->reserrno = errno;
 	if (th->res == -1 && th->reserrno == 0)
 		th->reserrno = EINVAL; // our syz syscalls may misbehave

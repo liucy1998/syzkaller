@@ -8,6 +8,11 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include "libsclog/sclog.h"
+
+// helper macro to retrieve call_index from function stack
+#define GET_CALL_INDEX(first_arg) (((intptr_t*)(&(first_arg)))[9])
+
 #if SYZ_EXECUTOR
 const int kExtraCoverSize = 256 << 10;
 struct cover_t;
