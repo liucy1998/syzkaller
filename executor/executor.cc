@@ -347,9 +347,9 @@ static void setup_features(char** enable, int n);
 int main(int argc, char** argv)
 {
 #ifdef CONTAINER_CHECKER
-	char sclog_path[30];
-	snprintf(sclog_path, sizeof(sclog_path), "/tmp/trace.%llu", procid);
-	init_sclog(sclog_path);
+	// char sclog_path[30];
+	// snprintf(sclog_path, sizeof(sclog_path), "/tmp/trace.%llu", procid);
+	init_sclog("/tmp/sclog", "a");
 #endif
 	if (argc == 2 && strcmp(argv[1], "version") == 0) {
 		puts(GOOS " " GOARCH " " SYZ_REVISION " " GIT_REVISION);

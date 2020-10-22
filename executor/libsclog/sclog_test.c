@@ -47,7 +47,7 @@ struct Syscall test_cases[] = {
 #define ntest (sizeof(test_cases)/sizeof(struct Syscall))
 
 void run_tests(void) {
-    init_sclog("test_log");
+    init_sclog("test_log", "a");
     long unsigned i = 0;
     for(; i < ntest; i++) {
         log_syscall(
