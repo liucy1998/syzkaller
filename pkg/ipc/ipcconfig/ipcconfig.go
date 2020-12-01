@@ -16,9 +16,10 @@ var (
 	flagThreaded = flag.Bool("threaded", true, "use threaded mode in executor")
 	flagCollide  = flag.Bool("collide", true, "collide syscalls to provoke data races")
 	flagSignal   = flag.Bool("cover", false, "collect feedback signals (coverage)")
-	flagSandbox  = flag.String("sandbox", "none", "sandbox for fuzzing (none/setuid/namespace/android)")
+	flagSandbox  = flag.String("sandbox", "none", "sandbox for fuzzing (none/setuid/namespace/android/lego)")
 	flagDebug    = flag.Bool("debug", false, "debug output from executor")
 	flagTimeout  = flag.Duration("timeout", 0, "execution timeout")
+	modeSandboxLego = flag.String("sandbox-lego-mode", "muinpCUjN", "m: mount ns; u: uts ns; i: ipc ns; n: net ns; p: pid ns; C: cgroups ns; U: user ns; c: chroot; N: nobody")
 )
 
 func Default(target *prog.Target) (*ipc.Config, *ipc.ExecOpts, error) {
@@ -35,6 +36,13 @@ func Default(target *prog.Target) (*ipc.Config, *ipc.ExecOpts, error) {
 	sandboxFlags, err := ipc.SandboxToFlags(*flagSandbox)
 	if err != nil {
 		return nil, nil, err
+	}
+	if *flagSandbox == "lego" {
+		mode, err := ipc.GetSandboxLegoMode(*modeSandboxLego) 
+		if err != nil {
+			return nil, nil, err
+		}
+		c.Flags |= mode
 	}
 	c.Flags |= sandboxFlags
 	sysTarget := targets.Get(target.OS, target.Arch)

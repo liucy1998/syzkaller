@@ -81,7 +81,11 @@ type Config struct {
 	//	requires building kernel with CONFIG_NAMESPACES, CONFIG_UTS_NS, CONFIG_USER_NS,
 	//	CONFIG_PID_NS and CONFIG_NET_NS. Supported only for some OSes.
 	// "android": (Android) Emulate permissions of an untrusted app.
+	// "lego": Pick sandbox type.
 	Sandbox string `json:"sandbox"`
+
+	// m: mount ns; u: uts ns; i: ipc ns; n: net ns; p: pid ns; C: cgroups ns; U: user ns; c: chroot; N: nobody
+	SandboxLegoMode string `json:"sandbox_lego_mode"`
 
 	// Use KCOV coverage (default: true).
 	Cover bool `json:"cover"`

@@ -115,13 +115,14 @@ static bool dedup(uint32 sig);
 #endif
 
 uint64 start_time_ms = 0;
-
+static uint32 sandbox_lego_mode;
 static bool flag_debug;
 static bool flag_coverage;
 static bool flag_sandbox_none;
 static bool flag_sandbox_setuid;
 static bool flag_sandbox_namespace;
 static bool flag_sandbox_android;
+static bool flag_sandbox_lego;
 static bool flag_extra_coverage;
 static bool flag_net_injection;
 static bool flag_net_devices;
@@ -441,6 +442,10 @@ int main(int argc, char** argv)
 	else if (flag_sandbox_android)
 		status = do_sandbox_android();
 #endif
+#if CONTAINER_CHECKER
+	else if (flag_sandbox_lego)
+		status = do_sandbox_lego(sandbox_lego_mode);
+#endif
 	else
 		fail("unknown sandbox type");
 
@@ -489,6 +494,10 @@ void parse_env_flags(uint64 flags)
 		flag_sandbox_namespace = true;
 	else if (flags & (1 << 4))
 		flag_sandbox_android = true;
+	else if (flags & (1 << 13)) {
+		flag_sandbox_lego = true;
+		sandbox_lego_mode = flags >> 14;
+	}
 	else
 		flag_sandbox_none = true;
 	flag_extra_coverage = flags & (1 << 5);

@@ -3616,6 +3616,239 @@ static int do_sandbox_namespace(void)
 }
 #endif
 
+#define SANDBOX_LEGO_PIDNS 0x1
+// Net namespace will enable by default
+// #define SANDBOX_LEGO_NETNS 0x2
+#define SANDBOX_LEGO_MNTNS 0x4
+#define SANDBOX_LEGO_CGROUPSNS 0x8
+#define SANDBOX_LEGO_IPCNS 0x10
+#define SANDBOX_LEGO_UTSNS 0x20
+#define SANDBOX_LEGO_USERNS 0x40
+#define SANDBOX_LEGO_NOBODY 0x80
+#define SANDBOX_LEGO_CHROOT 0x100
+
+static int real_uid_lego;
+static int real_gid_lego;
+__attribute__((aligned(64 << 10))) static char sandbox_stack_lego[1 << 20];
+
+static void sandbox_common_lego(uint32_t sandbox_lego_mode)
+{
+	prctl(PR_SET_PDEATHSIG, SIGKILL, 0, 0, 0);
+	setsid();
+
+#if SYZ_EXECUTOR || __NR_syz_init_net_socket || SYZ_DEVLINK_PCI
+	int netns = open("/proc/self/ns/net", O_RDONLY);
+	if (netns == -1)
+		fail("open(/proc/self/ns/net) failed");
+	if (dup2(netns, kInitNetNsFd) < 0)
+		fail("dup2(netns, kInitNetNsFd) failed");
+	close(netns);
+#endif
+
+	struct rlimit rlim;
+#if SYZ_EXECUTOR
+	rlim.rlim_cur = rlim.rlim_max = (200 << 20) +
+					(kMaxThreads * kCoverSize + kExtraCoverSize) * sizeof(void*);
+#else
+	rlim.rlim_cur = rlim.rlim_max = (200 << 20);
+#endif
+	setrlimit(RLIMIT_AS, &rlim);
+	rlim.rlim_cur = rlim.rlim_max = 32 << 20;
+	setrlimit(RLIMIT_MEMLOCK, &rlim);
+	rlim.rlim_cur = rlim.rlim_max = 136 << 20;
+	setrlimit(RLIMIT_FSIZE, &rlim);
+	rlim.rlim_cur = rlim.rlim_max = 1 << 20;
+	setrlimit(RLIMIT_STACK, &rlim);
+	rlim.rlim_cur = rlim.rlim_max = 0;
+	setrlimit(RLIMIT_CORE, &rlim);
+	rlim.rlim_cur = rlim.rlim_max = 256; // see kMaxFd
+	setrlimit(RLIMIT_NOFILE, &rlim);
+
+	// CLONE_NEWNS/NEWCGROUP cause EINVAL on some systems,
+	// so we do them separately of clone in do_sandbox_namespace.
+	if(sandbox_lego_mode & SANDBOX_LEGO_MNTNS) {
+		if (unshare(CLONE_NEWNS)) {
+			debug("unshare(CLONE_NEWNS): %d\n", errno);
+		}
+		if (mount(NULL, "/", NULL, MS_REC | MS_PRIVATE, NULL)) {
+			debug("mount(\"/\", MS_REC | MS_PRIVATE): %d\n", errno);
+		}
+	}
+	if(sandbox_lego_mode & SANDBOX_LEGO_IPCNS) {
+		if (unshare(CLONE_NEWIPC)) {
+			debug("unshare(CLONE_NEWIPC): %d\n", errno);
+		}
+	}
+	if(sandbox_lego_mode & SANDBOX_LEGO_CGROUPSNS) {
+		if (unshare(0x02000000)) {
+			debug("unshare(CLONE_NEWCGROUP): %d\n", errno);
+		}
+	}
+	if(sandbox_lego_mode & SANDBOX_LEGO_UTSNS) {
+		if (unshare(CLONE_NEWUTS)) {
+			debug("unshare(CLONE_NEWUTS): %d\n", errno);
+		}
+	}
+	if (unshare(CLONE_SYSVSEM)) {
+		debug("unshare(CLONE_SYSVSEM): %d\n", errno);
+	}
+	if(sandbox_lego_mode & SANDBOX_LEGO_IPCNS) {
+		// These sysctl's restrict ipc resource usage (by default it's possible
+		// to eat all system memory by creating e.g. lots of large sem sets).
+		// These sysctl's are per-namespace, so we need to set them inside
+		// of the test ipc namespace (after CLONE_NEWIPC).
+		typedef struct {
+			const char* name;
+			const char* value;
+		} sysctl_t;
+		static const sysctl_t sysctls[] = {
+			{"/proc/sys/kernel/shmmax", "16777216"},
+			{"/proc/sys/kernel/shmall", "536870912"},
+			{"/proc/sys/kernel/shmmni", "1024"},
+			{"/proc/sys/kernel/msgmax", "8192"},
+			{"/proc/sys/kernel/msgmni", "1024"},
+			{"/proc/sys/kernel/msgmnb", "1024"},
+			{"/proc/sys/kernel/sem", "1024 1048576 500 1024"},
+		};
+		unsigned i;
+		for (i = 0; i < sizeof(sysctls) / sizeof(sysctls[0]); i++)
+			write_file(sysctls[i].name, sysctls[i].value);
+	}
+}
+
+static int namespace_sandbox_proc_lego(void* arg)
+{
+
+	uint32_t sandbox_lego_mode = *((uint32_t *)arg);
+	sandbox_common_lego(sandbox_lego_mode);
+
+	if(sandbox_lego_mode & SANDBOX_LEGO_USERNS) {
+		// /proc/self/setgroups is not present on some systems, ignore error.
+		write_file("/proc/self/setgroups", "deny");
+		if (!write_file("/proc/self/uid_map", "0 %d 1\n", real_uid_lego))
+			fail("write of /proc/self/uid_map failed");
+		if (!write_file("/proc/self/gid_map", "0 %d 1\n", real_gid_lego))
+			fail("write of /proc/self/gid_map failed");
+	}
+
+#if SYZ_EXECUTOR || SYZ_NET_DEVICES
+	initialize_netdevices_init();
+#endif
+	// CLONE_NEWNET must always happen before tun setup,
+	// because we want the tun device in the test namespace.
+	if (unshare(CLONE_NEWNET))
+		fail("unshare(CLONE_NEWNET)");
+#if SYZ_EXECUTOR || SYZ_DEVLINK_PCI
+	initialize_devlink_pci();
+#endif
+#if SYZ_EXECUTOR || SYZ_NET_INJECTION
+	// We setup tun here as it needs to be in the test net namespace,
+	// which in turn needs to be in the test user namespace.
+	// However, IFF_NAPI_FRAGS will fail as we are not root already.
+	// TODO: we should create tun in the init net namespace and use setns
+	// to move it to the target namespace.
+	initialize_tun();
+#endif
+#if SYZ_EXECUTOR || SYZ_NET_DEVICES
+	initialize_netdevices();
+#endif
+
+	if(sandbox_lego_mode & SANDBOX_LEGO_CHROOT) {
+		if (mkdir("./syz-tmp", 0777))
+			fail("mkdir(syz-tmp) failed");
+		if (mount("", "./syz-tmp", "tmpfs", 0, NULL))
+			fail("mount(tmpfs) failed");
+		if (mkdir("./syz-tmp/newroot", 0777))
+			fail("mkdir failed");
+		if (mkdir("./syz-tmp/newroot/dev", 0700))
+			fail("mkdir failed");
+		unsigned bind_mount_flags = MS_BIND | MS_REC | MS_PRIVATE;
+		if (mount("/dev", "./syz-tmp/newroot/dev", NULL, bind_mount_flags, NULL))
+			fail("mount(dev) failed");
+		if (mkdir("./syz-tmp/newroot/proc", 0700))
+			fail("mkdir failed");
+		if (mount(NULL, "./syz-tmp/newroot/proc", "proc", 0, NULL))
+			fail("mount(proc) failed");
+		if (mkdir("./syz-tmp/newroot/selinux", 0700))
+			fail("mkdir failed");
+		// selinux mount used to be at /selinux, but then moved to /sys/fs/selinux.
+		const char* selinux_path = "./syz-tmp/newroot/selinux";
+		if (mount("/selinux", selinux_path, NULL, bind_mount_flags, NULL)) {
+			if (errno != ENOENT)
+				fail("mount(/selinux) failed");
+			if (mount("/sys/fs/selinux", selinux_path, NULL, bind_mount_flags, NULL) && errno != ENOENT)
+				fail("mount(/sys/fs/selinux) failed");
+		}
+		if (mkdir("./syz-tmp/newroot/sys", 0700))
+			fail("mkdir failed");
+		if (mount("/sys", "./syz-tmp/newroot/sys", 0, bind_mount_flags, NULL))
+			fail("mount(sysfs) failed");
+#if SYZ_EXECUTOR || SYZ_CGROUPS
+		initialize_cgroups();
+#endif
+		if (mkdir("./syz-tmp/pivot", 0777))
+			fail("mkdir failed");
+		if (syscall(SYS_pivot_root, "./syz-tmp", "./syz-tmp/pivot")) {
+			debug("pivot_root failed\n");
+			if (chdir("./syz-tmp"))
+				fail("chdir failed");
+		} else {
+			debug("pivot_root OK\n");
+			if (chdir("/"))
+				fail("chdir failed");
+			if (umount2("./pivot", MNT_DETACH))
+				fail("umount failed");
+		}
+		if (chroot("./newroot"))
+			fail("chroot failed");
+		if (chdir("/"))
+			fail("chdir failed");
+	}
+
+	drop_caps();
+
+	if(sandbox_lego_mode & SANDBOX_LEGO_NOBODY) {
+		const int nobody = 65534;
+		if (setgroups(0, NULL))
+			fail("failed to setgroups");
+		if (syscall(SYS_setresgid, nobody, nobody, nobody))
+			fail("failed to setresgid");
+		if (syscall(SYS_setresuid, nobody, nobody, nobody))
+			fail("failed to setresuid");
+
+		// This is required to open /proc/self/ files.
+		// Otherwise they are owned by root and we can't open them after setuid.
+		// See task_dump_owner function in kernel.
+		prctl(PR_SET_DUMPABLE, 1, 0, 0, 0);
+	}
+
+	loop();
+	doexit(1);
+}
+
+
+static int do_sandbox_lego(uint32_t sandbox_lego_mode)
+{
+	setup_common();
+#if SYZ_EXECUTOR || SYZ_VHCI_INJECTION
+	// HCIDEVUP requires CAP_ADMIN, so this needs to happen early.
+	initialize_vhci();
+#endif
+	real_uid_lego = getuid();
+	real_gid_lego = getgid();
+	mprotect(sandbox_stack_lego, 4096, PROT_NONE); // to catch stack underflows
+	int clone_flag = 0;
+	if(sandbox_lego_mode & SANDBOX_LEGO_USERNS) {
+		clone_flag |= CLONE_NEWUSER;
+	}
+	else if(sandbox_lego_mode & SANDBOX_LEGO_PIDNS) {
+		clone_flag |= CLONE_NEWPID;
+	}
+	int pid = clone(namespace_sandbox_proc_lego, &sandbox_stack_lego[sizeof(sandbox_stack_lego) - 64],
+			clone_flag, (void *)&sandbox_lego_mode);
+	return wait_for_loop(pid);
+}
+
 #if SYZ_EXECUTOR || SYZ_SANDBOX_ANDROID
 // seccomp only supported for Arm, Arm64, X86, and X86_64 archs
 #if GOARCH_arm || GOARCH_arm64 || GOARCH_386 || GOARCH_amd64

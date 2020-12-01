@@ -41,6 +41,16 @@ const (
 	FlagEnableCloseFds                           // close fds after each program
 	FlagEnableDevlinkPCI                         // setup devlink PCI device
 	FlagEnableVhciInjection                      // setup and use /dev/vhci for hci packet injection
+	FlagSandboxLego
+	ModeLegoPidNS
+	ModeLegoNetNS
+	ModeLegoMntNS
+	ModeLegoCgroupsNS
+	ModeLegoIpcNS
+	ModeLegoUtsNS
+	ModeLegoUserNS
+	ModeLegoNobody
+	ModeLegoChroot
 )
 
 // Per-exec flags for ExecOpts.Flags.
@@ -138,8 +148,10 @@ func SandboxToFlags(sandbox string) (EnvFlags, error) {
 		return FlagSandboxNamespace, nil
 	case "android":
 		return FlagSandboxAndroid, nil
+	case "lego":
+		return FlagSandboxLego, nil
 	default:
-		return 0, fmt.Errorf("sandbox must contain one of none/setuid/namespace/android")
+		return 0, fmt.Errorf("sandbox must contain one of none/setuid/namespace/android/lego")
 	}
 }
 
@@ -150,8 +162,40 @@ func FlagsToSandbox(flags EnvFlags) string {
 		return "namespace"
 	} else if flags&FlagSandboxAndroid != 0 {
 		return "android"
+	} else if flags&FlagSandboxLego != 0 {
+		return "lego"
 	}
 	return "none"
+}
+
+func GetSandboxLegoMode(mode_str string) (EnvFlags, error) {
+	var mode EnvFlags = 0
+	for _, r := range mode_str {
+		c := string(r)
+		switch c {
+		case "m":
+			mode |= ModeLegoMntNS
+		case "u":
+			mode |= ModeLegoUtsNS
+		case "i":
+			mode |= ModeLegoIpcNS
+		case "n":
+			mode |= ModeLegoNetNS
+		case "p":
+			mode |= ModeLegoPidNS
+		case "C":
+			mode |= ModeLegoCgroupsNS 
+		case "U":
+			mode |= ModeLegoUserNS
+		case "c":
+			mode |= ModeLegoChroot
+		case "N":
+			mode |= ModeLegoNobody
+		default:
+			return 0, fmt.Errorf("lego sandbox mode must be in muinpCUjN")
+		}
+	}
+	return mode, nil
 }
 
 func MakeEnv(config *Config, pid int) (*Env, error) {
