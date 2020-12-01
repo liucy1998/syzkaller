@@ -217,6 +217,7 @@ struct thread_t {
 	uint32 reserrno;
 	bool fault_injected;
 	cover_t cov;
+	FILE* f;
 };
 
 static thread_t threads[kMaxThreads];
@@ -350,7 +351,12 @@ int main(int argc, char** argv)
 #ifdef CONTAINER_CHECKER
 	// char sclog_path[30];
 	// snprintf(sclog_path, sizeof(sclog_path), "/tmp/trace.%llu", procid);
-	init_sclog("/tmp/sclog", "a");
+	init_sclog();
+	for (int i = 0; i < kMaxThreads; i++) {
+		char p[30];
+		snprintf(p, sizeof(p), "/tmp/sclog%d", i);
+		threads[i].f = fopen(p, "a");
+	}
 #endif
 	if (argc == 2 && strcmp(argv[1], "version") == 0) {
 		puts(GOOS " " GOARCH " " SYZ_REVISION " " GIT_REVISION);
@@ -603,6 +609,10 @@ void reply_execute(int status)
 // execute_one executes program stored in input_data.
 void execute_one()
 {
+	for (int i = 0; i < kMaxThreads; i++) {
+		// mark the start of a new program
+		log_syscall_printf(threads[i].f, "-\n");
+	}
 	// Duplicate global collide variable on stack.
 	// Fuzzer once come up with ioctl(fd, FIONREAD, 0x920000),
 	// where 0x920000 was exactly collide address, so every iteration reset collide to 0.
@@ -933,7 +943,7 @@ void handle_completion(thread_t* th)
 	const call_t* call = &syscalls[th->call_num];
 	if(!call->call) {
 		// use for sorting
-		log_syscall_with_index(th->call_index, call->sys_nr, th->num_args, th->args, th->res);
+		log_syscall_with_index(th->f, th->call_index, call->sys_nr, th->num_args, th->args, th->res);
 	}
 #endif
 }
