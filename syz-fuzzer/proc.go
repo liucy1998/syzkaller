@@ -289,6 +289,13 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, p *prog.Prog, stat Stat) *ipc.P
 	defer proc.fuzzer.gate.Leave(ticket)
 
 	proc.logProgram(opts, p)
+
+	// send the fuzzing process to manager before executing
+	proc.fuzzer.sendFuzzToManager(rpctype.RPCFuzz{
+		TimeStamp:  time.Now(),
+		Prog:       p.Serialize(),
+	})
+
 	for try := 0; ; try++ {
 		atomic.AddUint64(&proc.fuzzer.stats[stat], 1)
 		output, info, hanged, err := proc.env.Exec(opts, p)

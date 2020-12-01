@@ -6,10 +6,21 @@
 package rpctype
 
 import (
+	"time"
 	"github.com/google/syzkaller/pkg/host"
 	"github.com/google/syzkaller/pkg/ipc"
 	"github.com/google/syzkaller/pkg/signal"
 )
+
+type RPCFuzz struct {
+	TimeStamp   time.Time
+	Prog        []byte
+}
+
+type NewFuzzArgs struct {
+	Name string
+	RPCFuzz	
+}
 
 type RPCInput struct {
 	Call   string

@@ -55,6 +55,7 @@ type RPCManagerView interface {
 	fuzzerConnect() ([]rpctype.RPCInput, BugFrames)
 	machineChecked(result *rpctype.CheckArgs, enabledSyscalls map[*prog.Syscall]bool)
 	newInput(inp rpctype.RPCInput, sign signal.Signal) bool
+	newFuzz(inp rpctype.RPCFuzz) bool
 	candidateBatch(size int) []rpctype.RPCCandidate
 	rotateCorpus() bool
 }
@@ -257,6 +258,22 @@ func (serv *RPCServer) NewInput(a *rpctype.NewInputArgs, r *int) error {
 			other.inputs = append(other.inputs, a.RPCInput)
 		}
 	}
+	return nil
+}
+
+func (serv *RPCServer) NewFuzz(a *rpctype.NewFuzzArgs, r *int) error {
+	bad, disabled := checkProgram(serv.target, serv.targetEnabledSyscalls, a.RPCFuzz.Prog)
+	if bad || disabled {
+		log.Logf(0, "rejecting fuzzing program from fuzzer (bad=%v, disabled=%v):\n%s", bad, disabled, a.RPCFuzz.Prog)
+		return nil
+	}
+	serv.mu.Lock()
+	defer serv.mu.Unlock()
+
+	if !serv.mgr.newFuzz(a.RPCFuzz) {
+		return nil
+	}
+
 	return nil
 }
 

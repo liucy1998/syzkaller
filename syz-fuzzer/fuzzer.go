@@ -402,6 +402,16 @@ func (fuzzer *Fuzzer) sendInputToManager(inp rpctype.RPCInput) {
 	}
 }
 
+func (fuzzer *Fuzzer) sendFuzzToManager(inp rpctype.RPCFuzz) {
+	a := &rpctype.NewFuzzArgs{
+		Name:     fuzzer.name,
+		RPCFuzz:  inp,
+	}
+	if err := fuzzer.manager.Call("Manager.NewFuzz", a, nil); err != nil {
+		log.Fatalf("Manager.NewFuzz call failed: %v", err)
+	}
+}
+
 func (fuzzer *Fuzzer) addInputFromAnotherFuzzer(inp rpctype.RPCInput) {
 	p := fuzzer.deserializeInput(inp.Prog)
 	if p == nil {

@@ -17,6 +17,7 @@ import (
 	"sync"
 	"sync/atomic"
 	"time"
+	"strconv"
 
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/cover"
@@ -53,6 +54,7 @@ type Manager struct {
 	crashdir       string
 	serv           *RPCServer
 	corpusDB       *db.DB
+	fuzzDB         *db.DB // fuzzing records
 	startTime      time.Time
 	firstConnect   time.Time
 	fuzzingTime    time.Duration
@@ -449,10 +451,12 @@ func (mgr *Manager) vmLoop() {
 func (mgr *Manager) preloadCorpus() {
 	log.Logf(0, "loading corpus...")
 	corpusDB, err := db.Open(filepath.Join(mgr.cfg.Workdir, "corpus.db"))
+	fuzzDB, err := db.Open(filepath.Join(mgr.cfg.Workdir, "fuzz.db"))
 	if err != nil {
 		log.Fatalf("failed to open corpus database: %v", err)
 	}
 	mgr.corpusDB = corpusDB
+	mgr.fuzzDB = fuzzDB
 
 	if seedDir := filepath.Join(mgr.cfg.Syzkaller, "sys", mgr.cfg.TargetOS, "test"); osutil.IsExist(seedDir) {
 		seeds, err := ioutil.ReadDir(seedDir)
@@ -1094,6 +1098,17 @@ func (mgr *Manager) machineChecked(a *rpctype.CheckArgs, enabledSyscalls map[*pr
 	mgr.firstConnect = time.Now()
 }
 
+func (mgr *Manager) newFuzz(inp rpctype.RPCFuzz) bool {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	key := strconv.FormatInt(inp.TimeStamp.UnixNano(), 10)
+	mgr.fuzzDB.Save(key, inp.Prog, 0)
+	if err := mgr.fuzzDB.Flush(); err != nil {
+		log.Logf(0, "failed to save fuzz database: %v", err)
+		return false
+	}
+	return true
+}
 func (mgr *Manager) newInput(inp rpctype.RPCInput, sign signal.Signal) bool {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
