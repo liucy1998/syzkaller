@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/pkg/csource"
+	"github.com/google/syzkaller/pkg/ctchecker"
 	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/host"
 	"github.com/google/syzkaller/pkg/ipc"
@@ -45,6 +46,8 @@ type Fuzzer struct {
 	target            *prog.Target
 	triagedCandidates uint32
 	timeouts          targets.Timeouts
+	index             int
+	cc                bool
 
 	faultInjectionEnabled    bool
 	comparisonTracingEnabled bool
@@ -138,8 +141,10 @@ func main() {
 		flagManager = flag.String("manager", "", "manager rpc address")
 		flagProcs   = flag.Int("procs", 1, "number of parallel test processes")
 		flagOutput  = flag.String("output", "stdout", "write programs to none/stdout/dmesg/file")
-		flagTest    = flag.Bool("test", false, "enable image testing mode")      // used by syz-ci
-		flagRunTest = flag.Bool("runtest", false, "enable program testing mode") // used by pkg/runtest
+		flagTest    = flag.Bool("test", false, "enable image testing mode")                // used by syz-ci
+		flagRunTest = flag.Bool("runtest", false, "enable program testing mode")           // used by pkg/runtest
+		flagCC      = flag.Bool("cc", false, "container checker mode")                     // used by pkg/runtest
+		flagIndex   = flag.Int("index", 0, "index for fuzzer, used for container checker") // used by pkg/runtest
 	)
 	defer tool.Init()()
 	outputType := parseOutputType(*flagOutput)
@@ -216,7 +221,17 @@ func main() {
 		checkArgs.enabledCalls = r.EnabledCalls
 		checkArgs.allSandboxes = r.AllSandboxes
 		checkArgs.featureFlags = featureFlags
-		r.CheckResult, err = checkMachine(checkArgs)
+		if *flagCC {
+			// Modified from testing.go/CheckMachine
+			features := ctchecker.Check()
+			// Modified from fuzzer.go/createIPCConfig
+			// Since features are hard-coded, adding flags are also hard-coded
+			// TODO: do we need to enable NetReset/CloseFds?
+			config.Flags |= ipc.FlagEnableTun | ipc.FlagEnableNetDev | ipc.FlagEnableCgroups
+			r.CheckResult, err = checkCalls(checkArgs, features)
+		} else {
+			r.CheckResult, err = checkMachine(checkArgs)
+		}
 		if err != nil {
 			if r.CheckResult == nil {
 				r.CheckResult = new(rpctype.CheckArgs)
@@ -261,6 +276,8 @@ func main() {
 		faultInjectionEnabled:    r.CheckResult.Features[host.FeatureFault].Enabled,
 		comparisonTracingEnabled: r.CheckResult.Features[host.FeatureComparisons].Enabled,
 		corpusHashes:             make(map[hash.Sig]struct{}),
+		index:                    *flagIndex,
+		cc:                       *flagCC,
 	}
 	gateCallback := fuzzer.useBugFrames(r, *flagProcs)
 	fuzzer.gate = ipc.NewGate(2**flagProcs, gateCallback)

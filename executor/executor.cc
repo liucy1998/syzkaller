@@ -20,6 +20,7 @@
 #endif
 
 #include "defs.h"
+#include "ipc_shim.h"
 
 #if defined(__GNUC__)
 #define SYSCALLAPI
@@ -113,8 +114,10 @@ static void reply_handshake();
 
 #if SYZ_EXECUTOR_USES_SHMEM
 const int kMaxOutput = 16 << 20;
+#if !(CONTAINER_CHECKER)
 const int kInFd = 3;
 const int kOutFd = 4;
+#endif
 static uint32* output_data;
 static uint32* output_pos;
 static uint32* write_output(uint32 v);
@@ -189,8 +192,12 @@ static bool collide;
 uint32 completed;
 bool is_kernel_64_bit = true;
 
+#if CONTAINER_CHECKER
+static char *input_data;
+#else
 ALIGNED(INPUT_DATA_ALIGNMENT)
 static char input_data[kMaxInput];
+#endif
 
 // Checksum kinds.
 static const uint64 arg_csum_inet = 0;
@@ -368,6 +375,18 @@ static void setup_features(char** enable, int n);
 
 #include "test.h"
 
+static int in_pipe;
+static int out_pipe;
+static int err_pipe;
+static int prog_shm;
+static int cov_shm;
+static void set_pipe_shm(int pipe_base, int shm_base) {
+	in_pipe = pipe_base + 0;
+	out_pipe = pipe_base + 1;
+	err_pipe = pipe_base + 2;
+	prog_shm = shm_base + 0;
+	cov_shm = shm_base + 1;
+}
 int main(int argc, char** argv)
 {
 	if (argc == 2 && strcmp(argv[1], "version") == 0) {
@@ -397,12 +416,33 @@ int main(int argc, char** argv)
 	if (argc == 2 && strcmp(argv[1], "test") == 0)
 		return run_tests();
 
+#if CONTAINER_CHECKER
+	if (argc == 2 && strcmp(argv[1], "attacker") == 0) {
+		set_pipe_shm(3, 1);
+	}
+	if (argc == 2 && strcmp(argv[1], "detector") == 0) {
+		set_pipe_shm(6, 3);
+	}
+	debug("syz-executor %s starts successfully!", argv[1]);
+ 
+#endif
+
 	start_time_ms = current_time_ms();
 
 	os_init(argc, argv, (char*)SYZ_DATA_OFFSET, SYZ_NUM_PAGES * SYZ_PAGE_SIZE);
 	current_thread = &threads[0];
 
 #if SYZ_EXECUTOR_USES_SHMEM
+#if CONTAINER_CHECKER
+	// Use anonymous mmap to create buffer
+	if ((void *)(input_data=(char *)mmap(NULL, kMaxInput, PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0)) == (void *)-1)
+		fail("mmap of input file failed");
+	void* preferred = (void*)(0x1b2bc20000ull + (1 << 20) * (getpid() % 128));
+	output_data = (uint32*)mmap(preferred, kMaxOutput,
+				    PROT_READ | PROT_WRITE, MAP_SHARED | MAP_FIXED | MAP_ANON, -1, 0);
+	if (output_data != preferred)
+		fail("mmap of output file failed");
+#else
 	if (mmap(&input_data[0], kMaxInput, PROT_READ, MAP_PRIVATE | MAP_FIXED, kInFd, 0) != &input_data[0])
 		fail("mmap of input file failed");
 	// The output region is the only thing in executor process for which consistency matters.
@@ -423,9 +463,11 @@ int main(int argc, char** argv)
 	close(kInFd);
 	close(kOutFd);
 #endif
+#endif
 
 	use_temporary_dir();
 	install_segv_handler();
+	// This function duplicate fds of stdin/stdout/stderr, ignore it
 	setup_control_pipes();
 #if SYZ_EXECUTOR_USES_FORK_SERVER
 	receive_handshake();
@@ -537,7 +579,11 @@ void parse_env_flags(uint64 flags)
 void receive_handshake()
 {
 	handshake_req req = {};
+#if CONTAINER_CHECKER
+	int n = read_host_pipe(in_pipe, &req, sizeof(req));
+#else
 	int n = read(kInPipeFd, &req, sizeof(req));
+#endif
 	if (n != sizeof(req))
 		failmsg("handshake read failed", "read=%d", n);
 	if (req.magic != kInMagic)
@@ -550,8 +596,13 @@ void reply_handshake()
 {
 	handshake_reply reply = {};
 	reply.magic = kOutMagic;
+#if CONTAINER_CHECKER
+	if (write_host_pipe(out_pipe, &reply, sizeof(reply)) != sizeof(reply))
+		fail("control pipe write failed");
+#else
 	if (write(kOutPipeFd, &reply, sizeof(reply)) != sizeof(reply))
 		fail("control pipe write failed");
+#endif
 }
 #endif
 
@@ -560,8 +611,14 @@ static execute_req last_execute_req;
 void receive_execute()
 {
 	execute_req& req = last_execute_req;
+#if CONTAINER_CHECKER
+	if (read_host_pipe(in_pipe, &req, sizeof(req)) != (ssize_t)sizeof(req))	{
+		fail("control pipe read failed");
+	}
+#else
 	if (read(kInPipeFd, &req, sizeof(req)) != (ssize_t)sizeof(req))
 		fail("control pipe read failed");
+#endif
 	if (req.magic != kInMagic)
 		failmsg("bad execute request magic", "magic=0x%llx", req.magic);
 	if (req.prog_size > kMaxInput)
@@ -600,7 +657,11 @@ void receive_execute()
 		fail("need_prog: no program");
 	uint64 pos = 0;
 	for (;;) {
+#if CONTAINER_CHECKER
+		ssize_t rv = read_host_pipe(in_pipe, input_data + pos, kMaxInput - pos);
+#else
 		ssize_t rv = read(kInPipeFd, input_data + pos, sizeof(input_data) - pos);
+#endif
 		if (rv < 0)
 			fail("read failed");
 		pos += rv;
@@ -628,8 +689,13 @@ void reply_execute(int status)
 	reply.magic = kOutMagic;
 	reply.done = true;
 	reply.status = status;
+#if CONTAINER_CHECKER
+	if (write_host_pipe(out_pipe, &reply, sizeof(reply)) != sizeof(reply))
+		fail("control pipe write failed");
+#else
 	if (write(kOutPipeFd, &reply, sizeof(reply)) != sizeof(reply))
 		fail("control pipe write failed");
+#endif
 }
 
 // execute_one executes program stored in input_data.
@@ -646,6 +712,13 @@ void execute_one()
 	uint64 start = current_time_ms();
 
 retry:
+#if CONTAINER_CHECKER
+	// read program from host shm
+	read_host_shm(prog_shm, 0, (void *)input_data, kMaxInput);
+	// in case host process clear some fields: e.g. clear counter
+	// TODO: think more about this
+	read_host_shm(cov_shm, 0, (void *)output_data, kMaxOutput);
+#endif
 	uint64* input_pos = (uint64*)input_data;
 
 	if (flag_coverage && !colliding) {
@@ -952,15 +1025,28 @@ void handle_completion(thread_t* th)
 	running--;
 	if (running < 0) {
 		// This fires periodically for the past 2 years (see issue #502).
+#if CONTAINER_CHECKER
+		pprintf(err_pipe, "running=%d collide=%d completed=%d flag_threaded=%d flag_collide=%d current=%d\n",
+			running, collide, completed, flag_threaded, flag_collide, th->id);
+#else
 		fprintf(stderr, "running=%d collide=%d completed=%d flag_threaded=%d flag_collide=%d current=%d\n",
 			running, collide, completed, flag_threaded, flag_collide, th->id);
+#endif
 		for (int i = 0; i < kMaxThreads; i++) {
 			thread_t* th1 = &threads[i];
+#if CONTAINER_CHECKER
+			pprintf(err_pipe, "th #%2d: created=%d executing=%d colliding=%d"
+					" ready=%d done=%d call_index=%d res=%lld reserrno=%d\n",
+				i, th1->created, th1->executing, th1->colliding,
+				event_isset(&th1->ready), event_isset(&th1->done),
+				th1->call_index, (uint64)th1->res, th1->reserrno);
+#else
 			fprintf(stderr, "th #%2d: created=%d executing=%d colliding=%d"
 					" ready=%d done=%d call_index=%d res=%lld reserrno=%d\n",
 				i, th1->created, th1->executing, th1->colliding,
 				event_isset(&th1->ready), event_isset(&th1->done),
 				th1->call_index, (uint64)th1->res, th1->reserrno);
+#endif
 		}
 		exitf("negative running");
 	}
@@ -1009,6 +1095,9 @@ void write_call_output(thread_t* th, bool finished)
 			      (th->fault_injected ? call_flag_fault_injected : 0);
 	}
 #if SYZ_EXECUTOR_USES_SHMEM
+#if CONTAINER_CHECKER
+	void *cov_start = (void *)output_pos;
+#endif
 	write_output(th->call_index);
 	write_output(th->call_num);
 	write_output(reserrno);
@@ -1048,6 +1137,12 @@ void write_call_output(thread_t* th, bool finished)
 		      *signal_count_pos, *cover_count_pos, *comps_count_pos);
 	completed++;
 	write_completed(completed);
+#if CONTAINER_CHECKER
+	// write coverage back
+	write_host_shm(cov_shm, (uint64_t)cov_start-(uint64_t)output_data, cov_start, (uint64_t)output_pos-(uint64_t)cov_start);
+	// write counter back
+	write_host_shm(cov_shm, 0, output_data, sizeof(completed));
+#endif
 #else
 	call_reply reply;
 	reply.header.magic = kOutMagic;
@@ -1060,8 +1155,13 @@ void write_call_output(thread_t* th, bool finished)
 	reply.signal_size = 0;
 	reply.cover_size = 0;
 	reply.comps_size = 0;
+#if CONTAINER_CHECKER
+	if (write(out_pipe, &reply, sizeof(reply)) != sizeof(reply))
+		fail("control pipe call write failed");
+#else
 	if (write(kOutPipeFd, &reply, sizeof(reply)) != sizeof(reply))
 		fail("control pipe call write failed");
+#endif
 	debug_verbose("out: index=%u num=%u errno=%d finished=%d blocked=%d\n",
 		      th->call_index, th->call_num, reserrno, finished, blocked);
 #endif
@@ -1075,6 +1175,9 @@ void write_extra_output()
 	cover_collect(&extra_cov);
 	if (!extra_cov.size)
 		return;
+#if CONTAINER_CHECKER
+	void *cov_start = (void *)output_pos;
+#endif
 	write_output(-1); // call index
 	write_output(-1); // call num
 	write_output(999); // errno
@@ -1090,6 +1193,12 @@ void write_extra_output()
 	debug_verbose("extra: sig=%u cover=%u\n", *signal_count_pos, *cover_count_pos);
 	completed++;
 	write_completed(completed);
+#if CONTAINER_CHECKER
+	// write coverage back
+	write_host_shm(cov_shm, (uint64_t)cov_start-(uint64_t)output_data, cov_start, (uint64_t)output_pos-(uint64_t)cov_start);
+	// write counter back
+	write_host_shm(cov_shm, 0, output_data, sizeof(completed));
+#endif
 #endif
 }
 
@@ -1521,11 +1630,19 @@ void setup_features(char** enable, int n)
 void failmsg(const char* err, const char* msg, ...)
 {
 	int e = errno;
+#if CONTAINER_CHECKER
+	pprintf(err_pipe, "SYZFAIL: %s\n", err);
+#else
 	fprintf(stderr, "SYZFAIL: %s\n", err);
+#endif
 	if (msg) {
 		va_list args;
 		va_start(args, msg);
+#if CONTAINER_CHECKER
+		vpprintf(err_pipe, msg, args);
+#else
 		vfprintf(stderr, msg, args);
+#endif
 		va_end(args);
 	}
 	fprintf(stderr, " (errno %d: %s)\n", e, strerror(e));
@@ -1556,9 +1673,19 @@ void exitf(const char* msg, ...)
 	int e = errno;
 	va_list args;
 	va_start(args, msg);
+
+#if CONTAINER_CHECKER
+	vpprintf(err_pipe, msg, args);
+#else
 	vfprintf(stderr, msg, args);
+#endif
 	va_end(args);
+
+#if CONTAINER_CHECKER
+	pprintf(err_pipe, " (errno %d)\n", e);
+#else
 	fprintf(stderr, " (errno %d)\n", e);
+#endif
 	doexit(0);
 }
 
@@ -1569,7 +1696,11 @@ void debug(const char* msg, ...)
 	int err = errno;
 	va_list args;
 	va_start(args, msg);
+#if CONTAINER_CHECKER
+	vpprintf(err_pipe, msg, args);
+#else
 	vfprintf(stderr, msg, args);
+#endif
 	va_end(args);
 	fflush(stderr);
 	errno = err;

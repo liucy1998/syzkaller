@@ -17,6 +17,7 @@ import (
 	"unsafe"
 
 	"github.com/google/syzkaller/pkg/cover"
+	"github.com/google/syzkaller/pkg/ctchecker"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/signal"
 	"github.com/google/syzkaller/prog"
@@ -487,6 +488,8 @@ type command struct {
 	inrp     *os.File
 	outwp    *os.File
 	outmem   []byte
+	ospid    int
+	esproxy  ctchecker.ESProxy
 }
 
 const (
@@ -824,5 +827,343 @@ func (c *command) exec(opts *ExecOpts, progData []byte) (output []byte, hanged b
 	if exitStatus == statusFail {
 		err0 = fmt.Errorf("executor %v: exit status %d\n%s", c.pid, exitStatus, output)
 	}
+	return
+}
+
+func MakeEnvCC(config *Config, pid int, index int, attacker bool) (*Env, error) {
+	if config.Timeouts.Slowdown == 0 || config.Timeouts.Scale == 0 ||
+		config.Timeouts.Syscall == 0 || config.Timeouts.Program == 0 {
+		return nil, fmt.Errorf("ipc.MakeEnv: uninitialized timeouts (%+v)", config.Timeouts)
+	}
+	var inf, outf *os.File
+	var inmem, outmem []byte
+	var err error
+	exec_shm_prog := ctchecker.GetExecShmProg(index)
+	inf, inmem, err = exec_shm_prog.Open()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if inf != nil {
+			osutil.CloseMemMappedFile(inf, inmem)
+		}
+	}()
+	exec_shm_cov := ctchecker.GetExecShmCov(index)
+	outf, outmem, err = exec_shm_cov.Open()
+	if err != nil {
+		return nil, err
+	}
+	defer func() {
+		if outf != nil {
+			osutil.CloseMemMappedFile(outf, outmem)
+		}
+	}()
+	env := &Env{
+		in:      inmem,
+		out:     outmem,
+		inFile:  inf,
+		outFile: outf,
+		// hard-coded executor path here
+		bin:    []string{"./syz-executor"},
+		pid:    pid,
+		config: config,
+	}
+	if attacker {
+		env.bin = append(env.bin, "attacker")
+	} else {
+		env.bin = append(env.bin, "detector")
+	}
+	inf = nil
+	outf = nil
+	return env, nil
+}
+
+func makeCommandCC(pid int, bin []string, config *Config, outmem []byte,
+	index int) (*command, error) {
+	// randBytes := make([]byte, 32)
+	// rand.Read(randBytes)
+	// path.Join(tmpDirPath, "syzkaller-testdir-", hex.EncodeToString(randBytes))
+	// dir, err := ioutil.TempDir(tmpDirPath, "syzkaller-testdir")
+	// if err != nil {
+	// 	return nil, fmt.Errorf("failed to create temp dir: %v", err)
+	// }
+	// dir = osutil.Abs(dir)
+
+	// TODO: leave dir for executor server
+	var dir string
+	dir = ""
+
+	timeout := config.Timeouts.Program
+	if config.UseForkServer {
+		// Executor has an internal timeout and protects against most hangs when fork server is enabled,
+		// so we use quite large timeout. Executor can be slow due to global locks in namespaces
+		// and other things, so let's better wait than report false misleading crashes.
+		timeout *= 10
+	}
+
+	c := &command{
+		pid:     pid,
+		config:  config,
+		timeout: timeout,
+		dir:     dir,
+		outmem:  outmem,
+	}
+	defer func() {
+		if c != nil {
+			c.closeCC()
+		}
+	}()
+
+	esproxy, err := ctchecker.MakeESProxy(index)
+	if err != nil {
+		return nil, err
+	}
+	c.esproxy = esproxy
+
+	// if err := os.Chmod(dir, 0777); err != nil {
+	// 	return nil, fmt.Errorf("failed to chmod temp dir: %v", err)
+	// }
+
+	// Output capture pipe.
+	errfifo := ctchecker.GetExecFifoErr(index)
+	rp, err := errfifo.Open()
+
+	// executor->ipc command pipe.
+	outfifo := ctchecker.GetExecFifoOut(index)
+	inrp, err := outfifo.Open()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create pipe: %v", err)
+	}
+	c.inrp = inrp
+
+	// ipc->executor command pipe.
+	infifo := ctchecker.GetExecFifoIn(index)
+	outwp, err := infifo.Open()
+	if err != nil {
+		return nil, fmt.Errorf("failed to create pipe: %v", err)
+	}
+	c.outwp = outwp
+
+	c.readDone = make(chan []byte, 1)
+	c.exited = make(chan struct{})
+
+	extraenv := []string{"ASAN_OPTIONS=handle_segv=0 allow_user_segv_handler=1"}
+	c.ospid = ctchecker.Start(&c.esproxy, bin[0], bin[0:], extraenv)
+	fmt.Fprintf(os.Stderr, "executor ospid = %v\n", c.ospid)
+	if config.Flags&FlagDebug != 0 {
+		close(c.readDone)
+		go io.Copy(os.Stdout, rp)
+	} else {
+		go func(c *command) {
+			// Read out output in case executor constantly prints something.
+			const bufSize = 128 << 10
+			output := make([]byte, bufSize)
+			var size uint64
+			for {
+				n, err := rp.Read(output[size:])
+				if n > 0 {
+					size += uint64(n)
+					if size >= bufSize*3/4 {
+						copy(output, output[size-bufSize/2:size])
+						size = bufSize / 2
+					}
+				}
+				if err != nil {
+					rp.Close()
+					c.readDone <- output[:size]
+					close(c.readDone)
+					return
+				}
+			}
+		}(c)
+	}
+
+	// if executor exits, this will hang
+	if c.config.UseForkServer {
+		if err := c.handshake(); err != nil {
+			return nil, err
+		}
+	}
+	tmp := c
+	c = nil // disable defer above
+	return tmp, nil
+}
+
+func (c *command) closeCC() {
+	if c.cmd != nil {
+		ctchecker.Kill(&c.esproxy, c.ospid)
+	}
+	if c.inrp != nil {
+		c.inrp.Close()
+	}
+	if c.outwp != nil {
+		c.outwp.Close()
+	}
+}
+
+// Exec starts executor binary to execute program p and returns information about the execution:
+// output: process output
+// info: per-call info
+// hanged: program hanged and was killed
+// err0: failed to start the process or bug in executor itself.
+func (env *Env) ExecCC(opts *ExecOpts, p *prog.Prog, index int) (output []byte, info *ProgInfo, hanged bool, err0 error) {
+	// Copy-in serialized program.
+	progSize, err := p.SerializeForExec(env.in)
+	if err != nil {
+		err0 = err
+		return
+	}
+	var progData []byte
+	if !env.config.UseShmem {
+		progData = env.in[:progSize]
+	}
+	// Zero out the first two words (ncmd and nsig), so that we don't have garbage there
+	// if executor crashes before writing non-garbage there.
+	for i := 0; i < 4; i++ {
+		env.out[i] = 0
+	}
+
+	atomic.AddUint64(&env.StatExecs, 1)
+	if env.cmd == nil {
+		if p.Target.OS != targets.TestOS && targets.Get(p.Target.OS, p.Target.Arch).HostFuzzer {
+			// The executor is actually ssh,
+			// starting them too frequently leads to timeouts.
+			<-rateLimit.C
+		}
+		// tmpDirPath := "./"
+		atomic.AddUint64(&env.StatRestarts, 1)
+
+		fmt.Fprintf(os.Stderr, "Now try to start executor...\n")
+		env.cmd, err0 = makeCommandCC(env.pid, env.bin, env.config, env.out, index)
+		if err0 != nil {
+			return
+		}
+	}
+	output, hanged, err0 = env.cmd.execCC(opts, progData)
+	if err0 != nil {
+		env.cmd.closeCC()
+		env.cmd = nil
+		return
+	}
+
+	info, err0 = env.parseOutput(p)
+	if info != nil && env.config.Flags&FlagSignal == 0 {
+		addFallbackSignal(p, info)
+	}
+	if !env.config.UseForkServer {
+		env.cmd.closeCC()
+		env.cmd = nil
+	}
+	return
+}
+
+func (c *command) execCC(opts *ExecOpts, progData []byte) (output []byte, hanged bool, err0 error) {
+	req := &executeReq{
+		magic:            inMagic,
+		envFlags:         uint64(c.config.Flags),
+		execFlags:        uint64(opts.Flags),
+		pid:              uint64(c.pid),
+		faultCall:        uint64(opts.FaultCall),
+		faultNth:         uint64(opts.FaultNth),
+		syscallTimeoutMS: uint64(c.config.Timeouts.Syscall / time.Millisecond),
+		programTimeoutMS: uint64(c.config.Timeouts.Program / time.Millisecond),
+		slowdownScale:    uint64(c.config.Timeouts.Scale),
+		progSize:         uint64(len(progData)),
+	}
+	reqData := (*[unsafe.Sizeof(*req)]byte)(unsafe.Pointer(req))[:]
+	if _, err := c.outwp.Write(reqData); err != nil {
+		output = <-c.readDone
+		err0 = fmt.Errorf("executor %v: failed to write control pipe: %v", c.pid, err)
+		return
+	}
+	if progData != nil {
+		if _, err := c.outwp.Write(progData); err != nil {
+			output = <-c.readDone
+			err0 = fmt.Errorf("executor %v: failed to write control pipe: %v", c.pid, err)
+			return
+		}
+	}
+	// At this point program is executing.
+
+	done := make(chan bool)
+	hang := make(chan bool)
+	go func() {
+		t := time.NewTimer(c.timeout)
+		select {
+		case <-t.C:
+			ctchecker.Kill(&c.esproxy, c.ospid)
+			hang <- true
+		case <-done:
+			t.Stop()
+			hang <- false
+		}
+	}()
+	exitStatus := -1
+	completedCalls := (*uint32)(unsafe.Pointer(&c.outmem[0]))
+	outmem := c.outmem[4:]
+	for {
+		reply := &executeReply{}
+		replyData := (*[unsafe.Sizeof(*reply)]byte)(unsafe.Pointer(reply))[:]
+		if _, err := io.ReadFull(c.inrp, replyData); err != nil {
+			break
+		}
+		if reply.magic != outMagic {
+			fmt.Fprintf(os.Stderr, "executor %v: got bad reply magic 0x%x\n", c.pid, reply.magic)
+			os.Exit(1)
+		}
+		if reply.done != 0 {
+			exitStatus = int(reply.status)
+			break
+		}
+		callReply := &callReply{}
+		callReplyData := (*[unsafe.Sizeof(*callReply)]byte)(unsafe.Pointer(callReply))[:]
+		if _, err := io.ReadFull(c.inrp, callReplyData); err != nil {
+			break
+		}
+		if callReply.signalSize != 0 || callReply.coverSize != 0 || callReply.compsSize != 0 {
+			// This is unsupported yet.
+			fmt.Fprintf(os.Stderr, "executor %v: got call reply with coverage\n", c.pid)
+			os.Exit(1)
+		}
+		copy(outmem, callReplyData)
+		outmem = outmem[len(callReplyData):]
+		*completedCalls++
+	}
+	close(done)
+	if exitStatus == 0 {
+		// Program was OK.
+		<-hang
+		return
+	}
+
+	// If error, just exit
+	// Kill is synchronized...do we need sth like c.wait() here?
+	ctchecker.Kill(&c.esproxy, c.ospid)
+	output = <-c.readDone
+
+	// TODO:
+	// - More error handling?
+	// - What is hanged? how to set it?
+
+	// if err := c.wait(); <-hang {
+	// 	hanged = true
+	// 	if err != nil {
+	// 		output = append(output, err.Error()...)
+	// 		output = append(output, '\n')
+	// 	}
+	// 	return
+	// }
+
+	// if exitStatus == -1 {
+	// 	exitStatus = osutil.ProcessExitStatus(c.cmd.ProcessState)
+	// }
+
+	// Ignore all other errors.
+	// Without fork server executor can legitimately exit (program contains exit_group),
+	// with fork server the top process can exit with statusFail if it wants special handling.
+
+	// if exitStatus == statusFail {
+	// 	err0 = fmt.Errorf("executor %v: exit status %d\n%s", c.pid, exitStatus, output)
+	// }
 	return
 }

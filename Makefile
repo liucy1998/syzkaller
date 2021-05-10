@@ -129,8 +129,9 @@ ifneq ("$(NO_CROSS_COMPILER)", "")
 else
 	mkdir -p ./bin/$(TARGETOS)_$(TARGETARCH)
 	$(CC) -o ./bin/$(TARGETOS)_$(TARGETARCH)/syz-executor$(EXE) executor/executor.cc \
-		$(ADDCFLAGS) $(CFLAGS) -DGOOS_$(TARGETOS)=1 -DGOARCH_$(TARGETARCH)=1 \
+		$(ADDCFLAGS) $(CFLAGS) -DCONTAINER_CHECKER=1 -DGOOS_$(TARGETOS)=1 -DGOARCH_$(TARGETARCH)=1 \
 		-DHOSTGOOS_$(HOSTOS)=1 -DGIT_REVISION=\"$(REV)\"
+	$(CC) -o ./bin/$(TARGETOS)_$(TARGETARCH)/executor_server$(EXE) executor/executor_server.c
 endif
 endif
 endif

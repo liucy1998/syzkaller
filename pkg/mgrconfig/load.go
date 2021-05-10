@@ -30,9 +30,10 @@ type Derived struct {
 	TargetVMArch string
 
 	// Full paths to binaries we are going to use:
-	FuzzerBin   string
-	ExecprogBin string
-	ExecutorBin string
+	FuzzerBin         string
+	ExecprogBin       string
+	ExecutorBin       string
+	ExecutorServerBin string
 
 	Syscalls []int
 	Timeouts targets.Timeouts
@@ -240,6 +241,7 @@ func (cfg *Config) completeBinaries() error {
 	cfg.FuzzerBin = targetBin("syz-fuzzer", cfg.TargetVMArch)
 	cfg.ExecprogBin = targetBin("syz-execprog", cfg.TargetVMArch)
 	cfg.ExecutorBin = targetBin("syz-executor", cfg.TargetArch)
+	cfg.ExecutorServerBin = targetBin("executor_server", cfg.TargetArch)
 	// If the target already provides an executor binary, we don't need to copy it.
 	if cfg.SysTarget.ExecutorBin != "" {
 		cfg.ExecutorBin = ""

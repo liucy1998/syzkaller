@@ -156,6 +156,8 @@ type Config struct {
 
 	// Implementation details beyond this point. Filled after parsing.
 	Derived `json:"-"`
+
+	ContainerChecker bool `json:"container_checker"`
 }
 
 type Subsystem struct {

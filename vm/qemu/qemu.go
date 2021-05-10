@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/pkg/config"
+	"github.com/google/syzkaller/pkg/ctchecker"
 	"github.com/google/syzkaller/pkg/log"
 	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/pkg/report"
@@ -66,6 +67,8 @@ type Config struct {
 	Mem int `json:"mem"`
 	// For building kernels without -snapshot for pkg/build (true by default).
 	Snapshot bool `json:"snapshot"`
+	// Container checker mode
+	ContainerChecker bool `json:"container_checker"`
 }
 
 type Pool struct {
@@ -102,6 +105,8 @@ type instance struct {
 	merger      *vmimpl.OutputMerger
 	files       map[string]string
 	diagnose    chan bool
+	shms        []ctchecker.Shm
+	fifos       []ctchecker.Fifo
 }
 
 type archConfig struct {
@@ -451,6 +456,19 @@ func (inst *instance) boot() error {
 			"-append", strings.Join(cmdline, " "),
 		)
 	}
+	if inst.cfg.ContainerChecker {
+		inst.fifos, inst.shms = ctchecker.SetupFifosShms(inst.index)
+		for _, f := range inst.fifos {
+			p, _ := filepath.Abs(f.Path)
+			args = append(args,
+				"-device", "pipe,path="+p)
+		}
+		for _, s := range inst.shms {
+			p, _ := filepath.Abs(s.Path)
+			args = append(args,
+				"-device", "shm,path="+p+",size="+strconv.FormatInt(int64(s.Size), 10))
+		}
+	}
 	if inst.debug {
 		log.Logf(0, "running command: %v %#v", inst.cfg.Qemu, args)
 	}
@@ -518,7 +536,7 @@ func (inst *instance) Forward(port int) (string, error) {
 	if port == 0 {
 		return "", fmt.Errorf("vm/qemu: forward port is zero")
 	}
-	if !inst.target.HostFuzzer {
+	if !inst.target.HostFuzzer && !inst.cfg.ContainerChecker {
 		if inst.forwardPort != 0 {
 			return "", fmt.Errorf("vm/qemu: forward port already set")
 		}
@@ -540,7 +558,7 @@ func (inst *instance) targetDir() string {
 func (inst *instance) Copy(hostSrc string) (string, error) {
 	base := filepath.Base(hostSrc)
 	vmDst := filepath.Join(inst.targetDir(), base)
-	if inst.target.HostFuzzer {
+	if inst.target.HostFuzzer || inst.cfg.ContainerChecker {
 		if base == "syz-fuzzer" || base == "syz-execprog" {
 			return hostSrc, nil // we will run these on host
 		}
@@ -571,8 +589,26 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 	inst.merger.Add("ssh", rpipe)
 
 	sshArgs := vmimpl.SSHArgsForward(inst.debug, inst.sshkey, inst.port, inst.forwardPort)
+	if inst.cfg.ContainerChecker {
+		// start executor server, this will block the VM
+		errfifo := ctchecker.GetESFifoErr(inst.index)
+		rp, _ := errfifo.Open()
+		go io.Copy(os.Stdout, rp)
+		esargs := []string{"ssh"}
+		esargs = append(esargs, sshArgs...)
+		esargs = append(esargs, inst.sshuser+"@localhost", "cd "+inst.targetDir()+" && "+"nohup ./executor_server > foo.out 2> foo.err < /dev/null &")
+		cmd := osutil.Command(esargs[0], esargs[1:]...)
+		cmd.Dir = inst.workdir
+		if err := cmd.Start(); err != nil {
+			return nil, nil, err
+		}
+	}
 	args := strings.Split(command, " ")
-	if bin := filepath.Base(args[0]); inst.target.HostFuzzer &&
+	if inst.cfg.ContainerChecker {
+		args = append(args, "-index="+strconv.FormatInt(int64(inst.index), 10))
+		args = append(args, "-cc=true")
+	}
+	if bin := filepath.Base(args[0]); (inst.target.HostFuzzer || inst.cfg.ContainerChecker) &&
 		(bin == "syz-fuzzer" || bin == "syz-execprog") {
 		// Weird mode for fuchsia and akaros.
 		// Fuzzer and execprog are on host (we did not copy them), so we will run them as is,
@@ -595,7 +631,10 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 		log.Logf(0, "running command: %#v", args)
 	}
 	cmd := osutil.Command(args[0], args[1:]...)
-	cmd.Dir = inst.workdir
+	// In container checker, fuzzer access shm/fifo using relative path.
+	if !inst.cfg.ContainerChecker {
+		cmd.Dir = inst.workdir
+	}
 	cmd.Stdout = wpipe
 	cmd.Stderr = wpipe
 	if err := cmd.Start(); err != nil {

@@ -598,6 +598,13 @@ func (mgr *Manager) runInstanceInner(index int, instanceName string) (*report.Re
 		return nil, nil, fmt.Errorf("failed to copy binary: %v", err)
 	}
 
+	if mgr.cfg.ContainerChecker {
+		_, err := inst.Copy(mgr.cfg.ExecutorServerBin)
+		if err != nil {
+			return nil, nil, fmt.Errorf("failed to copy binary: %v", err)
+		}
+	}
+
 	// If ExecutorBin is provided, it means that syz-executor is already in the image,
 	// so no need to copy it.
 	executorBin := mgr.sysTarget.ExecutorBin

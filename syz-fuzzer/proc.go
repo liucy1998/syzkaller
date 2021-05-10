@@ -35,7 +35,13 @@ type Proc struct {
 }
 
 func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
-	env, err := ipc.MakeEnv(fuzzer.config, pid)
+	var env *ipc.Env
+	var err error
+	if fuzzer.cc {
+		env, err = ipc.MakeEnvCC(fuzzer.config, pid, fuzzer.index, true)
+	} else {
+		env, err = ipc.MakeEnv(fuzzer.config, pid)
+	}
 	if err != nil {
 		return nil, err
 	}
@@ -294,7 +300,15 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, p *prog.Prog, stat Stat) *ipc.P
 	proc.logProgram(opts, p)
 	for try := 0; ; try++ {
 		atomic.AddUint64(&proc.fuzzer.stats[stat], 1)
-		output, info, hanged, err := proc.env.Exec(opts, p)
+		var output []byte
+		var info *ipc.ProgInfo
+		var hanged bool
+		var err error
+		if proc.fuzzer.cc {
+			output, info, hanged, err = proc.env.ExecCC(opts, p, proc.fuzzer.index)
+		} else {
+			output, info, hanged, err = proc.env.Exec(opts, p)
+		}
 		if err != nil {
 			if err == prog.ErrExecBufferTooSmall {
 				// It's bad if we systematically fail to serialize programs,
