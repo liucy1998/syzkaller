@@ -34,6 +34,31 @@ static inline long write_host_shm(int idx, unsigned long offset, void *src, unsi
 
 }
 
+// Read 1 byte for each page in [dst, dst+size]
+// Assume [dst, dst+size) is user readable
+static inline void read_pages(void *dst, unsigned long size) {
+	volatile char t;
+	char *st = (char *)(dst);
+	char *ed = (char *)(((unsigned long)dst+size-1) & ~0xffful);
+	do {
+		// Enforce memory read
+		t = t = *st;
+		st += 0x1000ul;
+	} while(st <= ed);
+}
+
+// Enforce physical memory allocation. E.g. mmap allocates physical pages on demand.
+static inline long read_host_shm_safe(int idx, unsigned long offset, void *dst, unsigned long size) {
+	read_pages(dst, size);
+	return read_host_shm(idx, offset, dst, size);
+}
+
+// Enforce physical memory allocation. E.g. mmap allocates physical pages on demand.
+static inline long write_host_shm_safe(int idx, unsigned long offset, void *dst, unsigned long size) {
+	read_pages(dst, size);
+	return write_host_shm(idx, offset, dst, size);
+}
+
 static inline long read_host_pipe(int idx, void *dst, unsigned long size) {
 
 	return do_kvm_hypercall(KVM_HC_PIPE_READ, idx, (unsigned long) dst, size, 0ul);

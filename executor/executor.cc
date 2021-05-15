@@ -714,10 +714,10 @@ void execute_one()
 retry:
 #if CONTAINER_CHECKER
 	// read program from host shm
-	read_host_shm(prog_shm, 0, (void *)input_data, kMaxInput);
+	read_host_shm_safe(prog_shm, 0, (void *)input_data, kMaxInput);
 	// in case host process clear some fields: e.g. clear counter
 	// TODO: think more about this
-	read_host_shm(cov_shm, 0, (void *)output_data, kMaxOutput);
+	read_host_shm_safe(cov_shm, 0, (void *)output_data, kMaxOutput);
 #endif
 	uint64* input_pos = (uint64*)input_data;
 
@@ -1139,9 +1139,9 @@ void write_call_output(thread_t* th, bool finished)
 	write_completed(completed);
 #if CONTAINER_CHECKER
 	// write coverage back
-	write_host_shm(cov_shm, (uint64_t)cov_start-(uint64_t)output_data, cov_start, (uint64_t)output_pos-(uint64_t)cov_start);
+	write_host_shm_safe(cov_shm, (uint64_t)cov_start-(uint64_t)output_data, cov_start, (uint64_t)output_pos-(uint64_t)cov_start);
 	// write counter back
-	write_host_shm(cov_shm, 0, output_data, sizeof(completed));
+	write_host_shm_safe(cov_shm, 0, output_data, sizeof(completed));
 #endif
 #else
 	call_reply reply;
@@ -1195,9 +1195,9 @@ void write_extra_output()
 	write_completed(completed);
 #if CONTAINER_CHECKER
 	// write coverage back
-	write_host_shm(cov_shm, (uint64_t)cov_start-(uint64_t)output_data, cov_start, (uint64_t)output_pos-(uint64_t)cov_start);
+	write_host_shm_safe(cov_shm, (uint64_t)cov_start-(uint64_t)output_data, cov_start, (uint64_t)output_pos-(uint64_t)cov_start);
 	// write counter back
-	write_host_shm(cov_shm, 0, output_data, sizeof(completed));
+	write_host_shm_safe(cov_shm, 0, output_data, sizeof(completed));
 #endif
 #endif
 }
