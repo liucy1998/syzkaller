@@ -435,7 +435,9 @@ int main(int argc, char** argv)
 #if SYZ_EXECUTOR_USES_SHMEM
 #if CONTAINER_CHECKER
 	// Use anonymous mmap to create buffer
-	if ((void *)(input_data=(char *)mmap(NULL, kMaxInput, PROT_READ, MAP_PRIVATE | MAP_ANON, -1, 0)) == (void *)-1)
+	// BUG: if use MAP_PRIVATE flag, later write this physical memory will cause internal error/behave strange.
+	//      Guess this is related to the COW behind MAP_PRIVATE?
+	if ((void *)(input_data=(char *)mmap(NULL, kMaxInput, PROT_READ, MAP_SHARED | MAP_ANON, -1, 0)) == (void *)-1)
 		fail("mmap of input file failed");
 	void* preferred = (void*)(0x1b2bc20000ull + (1 << 20) * (getpid() % 128));
 	output_data = (uint32*)mmap(preferred, kMaxOutput,
