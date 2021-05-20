@@ -123,17 +123,5 @@ static inline int pprintln(int idx, const char *msg, ...) {
 	return len;
 } 
 
-// ------------------- syz-executor related ---------------------
-
-#define IN_PIPE 0
-#define OUT_PIPE 1 
-#define ERR_PIPE 2
-
-// program shm
-#define PROG_SHM 0 
-// coverage shm
-#define COV_SHM 1
-
-
 
 #endif
