@@ -123,7 +123,7 @@ type archConfig struct {
 var archConfigs = map[string]*archConfig{
 	"linux/amd64": {
 		Qemu:     "qemu-system-x86_64",
-		QemuArgs: "-enable-kvm -cpu host,migratable=off",
+		QemuArgs: "-enable-kvm -cpu host",
 		// e1000e fails on recent Debian distros with:
 		// Initialization of device e1000e failed: failed to find romfile "efi-e1000e.rom
 		// But other arches don't use e1000e, e.g. arm64 uses virtio by default.
@@ -607,6 +607,7 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 	if inst.cfg.ContainerChecker {
 		args = append(args, "-index="+strconv.FormatInt(int64(inst.index), 10))
 		args = append(args, "-cc=true")
+		args = append(args, "-mon="+strconv.FormatInt(int64(inst.monport), 10))
 	}
 	if bin := filepath.Base(args[0]); (inst.target.HostFuzzer || inst.cfg.ContainerChecker) &&
 		(bin == "syz-fuzzer" || bin == "syz-execprog") {

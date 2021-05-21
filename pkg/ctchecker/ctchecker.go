@@ -23,10 +23,12 @@ type Fifo struct {
 }
 
 type ESProxy struct {
-	CmdMem []byte
-	In     *os.File
-	Out    *os.File
-	Err    *os.File
+	CmdMem         []byte
+	In             *os.File
+	Out            *os.File
+	Err            *os.File
+	status         *os.File
+	statusChanDict map[int32]chan int32
 }
 
 // command
@@ -50,6 +52,11 @@ type ESKillReq struct {
 	Pid int
 }
 
+type ESStatus struct {
+	Pid    int32
+	Status int32
+}
+
 func addPrefix(index int, name string) string {
 	prefix := "./" + strconv.FormatInt(int64(index), 10) + "-"
 	return prefix + name
@@ -62,6 +69,9 @@ func GetESFifoOut(index int) Fifo {
 }
 func GetESFifoErr(index int) Fifo {
 	return Fifo{Path: addPrefix(index, "es-fifo-err")}
+}
+func GetESFifoStatus(index int) Fifo {
+	return Fifo{Path: addPrefix(index, "es-fifo-status")}
 }
 func GetExecFifoIn(index int) Fifo {
 	return Fifo{Path: addPrefix(index, "fifo-in")}
@@ -112,6 +122,7 @@ func GetFifosShms(index int) ([]Fifo, []Shm) {
 		GetESFifoIn(index),
 		GetESFifoOut(index),
 		GetESFifoErr(index),
+		GetESFifoStatus(index),
 		GetExecFifoIn(index),
 		GetExecFifoOut(index),
 		GetExecFifoErr(index),
@@ -143,12 +154,14 @@ func SetupFifosShms(index int) ([]Fifo, []Shm) {
 	return fifos, shms
 }
 
-func MakeESProxy(index int) (esp ESProxy, err error) {
+func MakeESProxy(index int) (esp *ESProxy, err error) {
+	esp = &ESProxy{}
 	var memfile *os.File
 	cmdshm := GetESShmCmd(index)
 	infifo := GetESFifoIn(index)
 	outfifo := GetESFifoOut(index)
 	errfifo := GetESFifoErr(index)
+	statusfifo := GetESFifoStatus(index)
 	memfile, esp.CmdMem, err = cmdshm.Open()
 	if err != nil {
 		return
@@ -166,10 +179,26 @@ func MakeESProxy(index int) (esp ESProxy, err error) {
 	if err != nil {
 		return
 	}
+	esp.status, err = statusfifo.Open()
+	if err != nil {
+		return
+	}
+	esp.statusChanDict = map[int32]chan int32{}
+	go func() {
+		for {
+			var s ESStatus
+			err = binary.Read(esp.status, binary.LittleEndian, &s)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "Binary cannot read status: %v", err)
+				break
+			}
+			esp.statusChanDict[s.Pid] <- s.Status
+		}
+	}()
 	return
 }
 
-func (execReq *ESExecReq) Send(p *ESProxy) (ret int) {
+func (execReq *ESExecReq) Send(p *ESProxy) (ret int32) {
 	// write shm
 	st, ed := 0, len(execReq.Path)
 	copy(p.CmdMem[st:ed], []byte(execReq.Path))
@@ -198,7 +227,7 @@ func (execReq *ESExecReq) Send(p *ESProxy) (ret int) {
 	// wait response
 	retBytes := make([]byte, 4)
 	p.Out.Read(retBytes)
-	ret = int(binary.LittleEndian.Uint32(retBytes))
+	ret = int32(binary.LittleEndian.Uint32(retBytes))
 
 	return
 }
@@ -212,7 +241,8 @@ func (r *ESExecReq) Print() {
 	fmt.Fprintf(os.Stderr, "Argv: %v\n", r.Argv)
 	fmt.Fprintf(os.Stderr, "Envp: %v\n", r.Envp)
 }
-func Start(p *ESProxy, bin string, args []string, extraEnv []string) (pid int) {
+
+func Start(p *ESProxy, bin string, args []string, extraEnv []string) (pid int32, status chan int32) {
 	execreq := &ESExecReq{
 		Head: ESExecReqHead{
 			ArgvNum: len(args),
@@ -224,7 +254,10 @@ func Start(p *ESProxy, bin string, args []string, extraEnv []string) (pid int) {
 		Envp: extraEnv,
 	}
 	execreq.Print()
-	return execreq.Send(p)
+	pid = execreq.Send(p)
+	status = make(chan int32, 4)
+	p.statusChanDict[pid] = status
+	return
 }
 
 func (killReq *ESKillReq) Send(p *ESProxy) (ret int) {
@@ -280,4 +313,30 @@ func Check() *host.Features {
 	enableFeature(&res[host.FeatureNetInjection])
 	enableFeature(&res[host.FeatureNetDevices])
 	return res
+}
+
+func (p *QMProxy) SaveSnapshot() {
+	res, err := p.hmp("savevm img")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Save Snapshot: response: %v\n", res)
+		fmt.Fprintf(os.Stderr, "Save Snapshot: fail!\n")
+	}
+	res, err = p.hmp("cont")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Cont: response: %v\n", res)
+		fmt.Fprintf(os.Stderr, "Cont: fail!, error: %v\n", err)
+	}
+}
+
+func (p *QMProxy) LoadSnapshot() {
+	res, err := p.hmp("loadvm img")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Reload Snapshot: response: %v\n", res)
+		fmt.Fprintf(os.Stderr, "Reload Snapshot: fail!\n")
+	}
+	res, err = p.hmp("cont")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Cont: response: %v\n", res)
+		fmt.Fprintf(os.Stderr, "Cont: fail!, error: %v\n", err)
+	}
 }

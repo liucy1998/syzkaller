@@ -48,6 +48,7 @@ type Fuzzer struct {
 	timeouts          targets.Timeouts
 	index             int
 	cc                bool
+	qmProxy           ctchecker.QMProxy
 
 	faultInjectionEnabled    bool
 	comparisonTracingEnabled bool
@@ -145,6 +146,7 @@ func main() {
 		flagRunTest = flag.Bool("runtest", false, "enable program testing mode")           // used by pkg/runtest
 		flagCC      = flag.Bool("cc", false, "container checker mode")                     // used by pkg/runtest
 		flagIndex   = flag.Int("index", 0, "index for fuzzer, used for container checker") // used by pkg/runtest
+		flagMon     = flag.Int("mon", 0, "QEMU monitor port")
 	)
 	defer tool.Init()()
 	outputType := parseOutputType(*flagOutput)
@@ -278,6 +280,7 @@ func main() {
 		corpusHashes:             make(map[hash.Sig]struct{}),
 		index:                    *flagIndex,
 		cc:                       *flagCC,
+		qmProxy:                  ctchecker.QMProxy{MonPort: *flagMon},
 	}
 	gateCallback := fuzzer.useBugFrames(r, *flagProcs)
 	fuzzer.gate = ipc.NewGate(2**flagProcs, gateCallback)

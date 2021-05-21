@@ -21,6 +21,7 @@
 
 #include "defs.h"
 #include "ipc_shim.h"
+#include "executor_server.h"
 
 #if defined(__GNUC__)
 #define SYSCALLAPI
@@ -380,7 +381,10 @@ static int out_pipe;
 static int err_pipe;
 static int prog_shm;
 static int cov_shm;
-static void set_pipe_shm(int pipe_base, int shm_base) {
+static void set_pipe_shm(int idx) {
+	int pipe_base = EXECUTOR_PIPE_BASE + idx*3;
+	int shm_base = EXECUTOR_SHM_BASE + idx*2;
+
 	in_pipe = pipe_base + 0;
 	out_pipe = pipe_base + 1;
 	err_pipe = pipe_base + 2;
@@ -418,10 +422,10 @@ int main(int argc, char** argv)
 
 #if CONTAINER_CHECKER
 	if (argc == 2 && strcmp(argv[1], "attacker") == 0) {
-		set_pipe_shm(3, 1);
+		set_pipe_shm(0);
 	}
 	if (argc == 2 && strcmp(argv[1], "detector") == 0) {
-		set_pipe_shm(6, 3);
+		set_pipe_shm(1);
 	}
 	debug("syz-executor %s starts successfully!", argv[1]);
  
@@ -708,12 +712,6 @@ void execute_one()
 	// where 0x920000 was exactly collide address, so every iteration reset collide to 0.
 	bool colliding = false;
 #if SYZ_EXECUTOR_USES_SHMEM
-	output_pos = output_data;
-	write_output(0); // Number of executed syscalls (updated later).
-#endif
-	uint64 start = current_time_ms();
-
-retry:
 #if CONTAINER_CHECKER
 	// read program from host shm
 	read_host_shm_safe(prog_shm, 0, (void *)input_data, kMaxInput);
@@ -721,6 +719,13 @@ retry:
 	// TODO: think more about this
 	read_host_shm_safe(cov_shm, 0, (void *)output_data, kMaxOutput);
 #endif
+	output_pos = output_data;
+	write_output(0); // Number of executed syscalls (updated later).
+	write_host_shm_safe(cov_shm, 0, output_pos, 4);
+#endif
+	uint64 start = current_time_ms();
+
+retry:
 	uint64* input_pos = (uint64*)input_data;
 
 	if (flag_coverage && !colliding) {

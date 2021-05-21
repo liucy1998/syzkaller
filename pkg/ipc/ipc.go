@@ -13,6 +13,7 @@ import (
 	"reflect"
 	"strings"
 	"sync/atomic"
+	"syscall"
 	"time"
 	"unsafe"
 
@@ -487,9 +488,11 @@ type command struct {
 	exited   chan struct{}
 	inrp     *os.File
 	outwp    *os.File
+	errrp    *os.File
+	status   chan int32
 	outmem   []byte
-	ospid    int
-	esproxy  ctchecker.ESProxy
+	ospid    int32
+	esproxy  *ctchecker.ESProxy
 }
 
 const (
@@ -879,7 +882,7 @@ func MakeEnvCC(config *Config, pid int, index int, attacker bool) (*Env, error) 
 }
 
 func makeCommandCC(pid int, bin []string, config *Config, outmem []byte,
-	index int) (*command, error) {
+	index int, qp *ctchecker.QMProxy) (*command, error) {
 	// randBytes := make([]byte, 32)
 	// rand.Read(randBytes)
 	// path.Join(tmpDirPath, "syzkaller-testdir-", hex.EncodeToString(randBytes))
@@ -910,7 +913,7 @@ func makeCommandCC(pid int, bin []string, config *Config, outmem []byte,
 	}
 	defer func() {
 		if c != nil {
-			c.closeCC()
+			// TODO: what should we do here?
 		}
 	}()
 
@@ -926,7 +929,7 @@ func makeCommandCC(pid int, bin []string, config *Config, outmem []byte,
 
 	// Output capture pipe.
 	errfifo := ctchecker.GetExecFifoErr(index)
-	rp, err := errfifo.Open()
+	c.errrp, err = errfifo.Open()
 
 	// executor->ipc command pipe.
 	outfifo := ctchecker.GetExecFifoOut(index)
@@ -948,11 +951,11 @@ func makeCommandCC(pid int, bin []string, config *Config, outmem []byte,
 	c.exited = make(chan struct{})
 
 	extraenv := []string{"ASAN_OPTIONS=handle_segv=0 allow_user_segv_handler=1"}
-	c.ospid = ctchecker.Start(&c.esproxy, bin[0], bin[0:], extraenv)
+	c.ospid, c.status = ctchecker.Start(c.esproxy, bin[0], bin[0:], extraenv)
 	fmt.Fprintf(os.Stderr, "executor ospid = %v\n", c.ospid)
 	if config.Flags&FlagDebug != 0 {
 		close(c.readDone)
-		go io.Copy(os.Stdout, rp)
+		go io.Copy(os.Stdout, c.errrp)
 	} else {
 		go func(c *command) {
 			// Read out output in case executor constantly prints something.
@@ -960,7 +963,7 @@ func makeCommandCC(pid int, bin []string, config *Config, outmem []byte,
 			output := make([]byte, bufSize)
 			var size uint64
 			for {
-				n, err := rp.Read(output[size:])
+				n, err := c.errrp.Read(output[size:])
 				if n > 0 {
 					size += uint64(n)
 					if size >= bufSize*3/4 {
@@ -969,7 +972,8 @@ func makeCommandCC(pid int, bin []string, config *Config, outmem []byte,
 					}
 				}
 				if err != nil {
-					rp.Close()
+					// NOTE: if executor hanged, we might double close stderr pipe here.
+					c.errrp.Close()
 					c.readDone <- output[:size]
 					close(c.readDone)
 					return
@@ -984,21 +988,14 @@ func makeCommandCC(pid int, bin []string, config *Config, outmem []byte,
 			return nil, err
 		}
 	}
+
+	// wait 2 seconds for VM stop
+	time.Sleep(time.Duration(2) * time.Second)
+	qp.SaveSnapshot()
+
 	tmp := c
 	c = nil // disable defer above
 	return tmp, nil
-}
-
-func (c *command) closeCC() {
-	if c.cmd != nil {
-		ctchecker.Kill(&c.esproxy, c.ospid)
-	}
-	if c.inrp != nil {
-		c.inrp.Close()
-	}
-	if c.outwp != nil {
-		c.outwp.Close()
-	}
 }
 
 // Exec starts executor binary to execute program p and returns information about the execution:
@@ -1006,7 +1003,7 @@ func (c *command) closeCC() {
 // info: per-call info
 // hanged: program hanged and was killed
 // err0: failed to start the process or bug in executor itself.
-func (env *Env) ExecCC(opts *ExecOpts, p *prog.Prog, index int) (output []byte, info *ProgInfo, hanged bool, err0 error) {
+func (env *Env) ExecCC(opts *ExecOpts, p *prog.Prog, index int, qp *ctchecker.QMProxy) (output []byte, info *ProgInfo, hanged bool, err0 error) {
 	// Copy-in serialized program.
 	progSize, err := p.SerializeForExec(env.in)
 	if err != nil {
@@ -1034,15 +1031,28 @@ func (env *Env) ExecCC(opts *ExecOpts, p *prog.Prog, index int) (output []byte, 
 		atomic.AddUint64(&env.StatRestarts, 1)
 
 		fmt.Fprintf(os.Stderr, "Now try to start executor...\n")
-		env.cmd, err0 = makeCommandCC(env.pid, env.bin, env.config, env.out, index)
+		env.cmd, err0 = makeCommandCC(env.pid, env.bin, env.config, env.out, index, qp)
 		if err0 != nil {
 			return
 		}
 	}
 	output, hanged, err0 = env.cmd.execCC(opts, progData)
+	qp.LoadSnapshot()
+	if hanged {
+		// Reopen pipes
+
+		// Output capture pipe.
+		errfifo := ctchecker.GetExecFifoErr(index)
+		rp, _ := errfifo.Open()
+		env.cmd.errrp = rp
+
+		// executor->ipc command pipe.
+		outfifo := ctchecker.GetExecFifoOut(index)
+		inrp, _ := outfifo.Open()
+		env.cmd.inrp = inrp
+	}
+
 	if err0 != nil {
-		env.cmd.closeCC()
-		env.cmd = nil
 		return
 	}
 
@@ -1050,10 +1060,11 @@ func (env *Env) ExecCC(opts *ExecOpts, p *prog.Prog, index int) (output []byte, 
 	if info != nil && env.config.Flags&FlagSignal == 0 {
 		addFallbackSignal(p, info)
 	}
-	if !env.config.UseForkServer {
-		env.cmd.closeCC()
-		env.cmd = nil
-	}
+
+	// Assume we must use fork server
+	// if !env.config.UseForkServer {
+
+	// }
 	return
 }
 
@@ -1091,7 +1102,9 @@ func (c *command) execCC(opts *ExecOpts, progData []byte) (output []byte, hanged
 		t := time.NewTimer(c.timeout)
 		select {
 		case <-t.C:
-			ctchecker.Kill(&c.esproxy, c.ospid)
+			// wake up and terminate related blocking reading threads
+			c.inrp.Close()
+			c.errrp.Close()
 			hang <- true
 		case <-done:
 			t.Stop()
@@ -1136,34 +1149,19 @@ func (c *command) execCC(opts *ExecOpts, progData []byte) (output []byte, hanged
 		return
 	}
 
-	// If error, just exit
-	// Kill is synchronized...do we need sth like c.wait() here?
-	ctchecker.Kill(&c.esproxy, c.ospid)
 	output = <-c.readDone
 
-	// TODO:
-	// - More error handling?
-	// - What is hanged? how to set it?
+	select {
+	case status := <-c.status:
+		if exitStatus == -1 {
+			exitStatus = syscall.WaitStatus(status).ExitStatus()
+		}
+		if exitStatus == statusFail {
+			err0 = fmt.Errorf("executor %v: exit status %d\n%s", c.pid, exitStatus, output)
+		}
+	case <-hang:
+		hanged = true
+	}
 
-	// if err := c.wait(); <-hang {
-	// 	hanged = true
-	// 	if err != nil {
-	// 		output = append(output, err.Error()...)
-	// 		output = append(output, '\n')
-	// 	}
-	// 	return
-	// }
-
-	// if exitStatus == -1 {
-	// 	exitStatus = osutil.ProcessExitStatus(c.cmd.ProcessState)
-	// }
-
-	// Ignore all other errors.
-	// Without fork server executor can legitimately exit (program contains exit_group),
-	// with fork server the top process can exit with statusFail if it wants special handling.
-
-	// if exitStatus == statusFail {
-	// 	err0 = fmt.Errorf("executor %v: exit status %d\n%s", c.pid, exitStatus, output)
-	// }
 	return
 }

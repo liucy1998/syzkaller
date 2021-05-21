@@ -550,6 +550,9 @@ static void execute_one(void);
 #include <signal.h>
 #include <sys/types.h>
 #include <sys/wait.h>
+#if CONTAINER_CHECKER
+#include "ipc_shim.h"
+#endif
 
 #if GOOS_linux
 #define WAIT_FLAGS __WALL
@@ -592,6 +595,9 @@ static void loop(void)
 #endif
 #if SYZ_HAVE_RESET_LOOP
 		reset_loop();
+#endif
+#if CONTAINER_CHECKER
+		stop_vm();
 #endif
 #if SYZ_EXECUTOR
 		receive_execute();
@@ -690,6 +696,9 @@ static void loop(void)
 			fail("child failed");
 		}
 		reply_execute(0);
+#endif
+#if CONTAINER_CHECKER
+		stop_vm();
 #endif
 #if SYZ_EXECUTOR || SYZ_USE_TMP_DIR
 		remove_dir(cwdbuf);

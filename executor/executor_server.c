@@ -11,6 +11,7 @@
 #include <errno.h>
 
 #include "ipc_shim.h"
+#include "executor_server.h"
 
 
 #define RUN_EXECUTOR 23
@@ -46,14 +47,15 @@ struct Reply {
     int ret;
 };
 
-#define IN_PIPE 0
-#define OUT_PIPE 1
-#define ERR_PIPE 2
-#define SHM 0
-#define SHM_SIZE 8192
+struct ProcessStatus {
+    int pid;
+    int status;
+};
 
-#define debug(...) pprintln(ERR_PIPE, "[debug] executor server: " __VA_ARGS__)
-#define fatal(...) pprintln(ERR_PIPE, "[fatal] executor server: " __VA_ARGS__)
+#define ES_SHM_SIZE 8192
+
+#define debug(...) pprintln(ES_ERR_PIPE, "[debug] executor server: " __VA_ARGS__)
+#define fatal(...) pprintln(ES_ERR_PIPE, "[fatal] executor server: " __VA_ARGS__)
 #define err(msg) do { fatal(msg ": %s", strerror(errno));} while (0)
 
 
@@ -95,12 +97,20 @@ void reply(int ret) {
     struct Reply r;
 
     r.ret = ret;
-    write_host_pipe(OUT_PIPE, &r, sizeof(struct Reply));
+    write_host_pipe(ES_OUT_PIPE, &r, sizeof(struct Reply));
+}
+
+void send_status(int pid, int status) {
+    struct ProcessStatus s = {
+        .pid = pid,
+        .status = status
+    };
+    write_host_pipe(ES_STATUS_PIPE, &s, sizeof(struct ProcessStatus));
 }
 
 void recv_req(struct Req *r) {
     memset(r, 0, sizeof(struct Req));
-    read_host_pipe(IN_PIPE, r, sizeof(struct Req));
+    read_host_pipe(ES_IN_PIPE, r, sizeof(struct Req));
 }
 
 int recv_execreq(void *data, size_t max_len, struct ExecReq *er) {
@@ -108,14 +118,14 @@ int recv_execreq(void *data, size_t max_len, struct ExecReq *er) {
     int i;
 
     memset(er, 0, sizeof(struct ExecReq));
-    read_host_pipe(IN_PIPE, &er->head, sizeof(struct ExecReqHead));
+    read_host_pipe(ES_IN_PIPE, &er->head, sizeof(struct ExecReqHead));
 
     if (er->head.shm_size > max_len) {
-        fatal("exec request size > %d", SHM_SIZE);
+        fatal("exec request size > %d", ES_SHM_SIZE);
         return -1;
     }
     memset(data, 0, max_len);
-    read_host_shm(SHM, 0, data, er->head.shm_size);
+    read_host_shm(ES_SHM, 0, data, er->head.shm_size);
 
     ret = deserialize_execreq(data, er);
     debug("receiving execute request...");
@@ -135,7 +145,7 @@ int recv_execreq(void *data, size_t max_len, struct ExecReq *er) {
 
 int recv_killreq(struct KillReq *kr) {
 
-    read_host_pipe(IN_PIPE, &kr, sizeof(struct KillReq));
+    read_host_pipe(ES_IN_PIPE, &kr, sizeof(struct KillReq));
 }
 
 int run_execreq(struct ExecReq *er) {
@@ -147,13 +157,36 @@ int run_execreq(struct ExecReq *er) {
         return -1;
     }
     if (pid == 0) {
-        execve(er->path, er->argv, er->envp);
-        exit(0);
+        pid = fork();
+        if (pid == -1) {
+            err("run_execenv fork");
+            return -1;
+        }
+        if (pid == 0) {
+            int ret = execve(er->path, er->argv, er->envp);
+            if (ret == -1) {
+                err("execve");
+                exit(-1);
+            }
+        }
+        for (;;) {
+            int status, ret;
+            ret = waitpid(pid, &status, 0);
+            if (ret == -1) {
+                err("waitpid");
+                exit(-1);
+            }
+            if (WIFEXITED(status) || WIFSIGNALED(status)) {
+                send_status(getpid(), status);
+                exit(0);
+            }
+        }
+        
     }
     return pid;
 }
 
-static char input[SHM_SIZE];
+static char input[ES_SHM_SIZE];
 
 int main(int argc , char *argv[], char *envp[]) {
     // TODO: pass pipe/shm index using argv 
@@ -167,7 +200,7 @@ int main(int argc , char *argv[], char *envp[]) {
         recv_req(&r);
         switch(r.command) {
             case RUN_EXECUTOR:
-                ret = recv_execreq(input, SHM_SIZE, &er);
+                ret = recv_execreq(input, ES_SHM_SIZE, &er);
                 if (ret < 0) {
                     reply(-1);
                     break;

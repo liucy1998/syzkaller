@@ -9,6 +9,7 @@
 #define KVM_HC_SHM_WRITE 29
 #define KVM_HC_PIPE_READ 30
 #define KVM_HC_PIPE_WRITE 31
+#define KVM_HC_VMSTATE 32
 
 #define KVM_HYPERCALL ".byte 0x0f,0x01,0xc1"
 static inline long do_kvm_hypercall(unsigned int nr, unsigned long p1,
@@ -123,5 +124,12 @@ static inline int pprintln(int idx, const char *msg, ...) {
 	return len;
 } 
 
+static inline void vmstate(int op) {
+	do_kvm_hypercall(KVM_HC_VMSTATE, op, 0ul, 0ul, 0ul);
+}
+
+static inline void stop_vm() {
+	vmstate(0);
+}
 
 #endif

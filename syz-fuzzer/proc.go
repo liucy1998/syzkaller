@@ -305,7 +305,7 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, p *prog.Prog, stat Stat) *ipc.P
 		var hanged bool
 		var err error
 		if proc.fuzzer.cc {
-			output, info, hanged, err = proc.env.ExecCC(opts, p, proc.fuzzer.index)
+			output, info, hanged, err = proc.env.ExecCC(opts, p, proc.fuzzer.index, &proc.fuzzer.qmProxy)
 		} else {
 			output, info, hanged, err = proc.env.Exec(opts, p)
 		}
