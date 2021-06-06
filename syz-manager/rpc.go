@@ -58,6 +58,7 @@ type RPCManagerView interface {
 	fuzzerConnect([]host.KernelModule) (
 		[]rpctype.RPCInput, BugFrames, map[uint32]uint32, []byte, error)
 	machineChecked(result *rpctype.CheckArgs, enabledSyscalls map[*prog.Syscall]bool)
+	newCCReport(r *rpctype.CCReport)
 	newInput(inp rpctype.RPCInput, sign signal.Signal) bool
 	candidateBatch(size int) []rpctype.RPCCandidate
 	rotateCorpus() bool
@@ -243,7 +244,12 @@ func (serv *RPCServer) Check(a *rpctype.CheckArgs, r *int) error {
 	serv.rotator = prog.MakeRotator(serv.cfg.Target, serv.targetEnabledSyscalls, serv.rnd)
 	return nil
 }
-
+func (serv *RPCServer) NewDet(a *rpctype.CCReportArgs, r *int) error {
+	serv.mu.Lock()
+	defer serv.mu.Unlock()
+	serv.mgr.newCCReport(&a.CCReport)
+	return nil
+}
 func (serv *RPCServer) NewInput(a *rpctype.NewInputArgs, r *int) error {
 	inputSignal := a.Signal.Deserialize()
 	log.Logf(4, "new input from %v for syscall %v (signal=%v, cover=%v)",

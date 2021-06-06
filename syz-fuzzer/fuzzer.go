@@ -49,6 +49,11 @@ type Fuzzer struct {
 	index             int
 	cc                bool
 	qmProxy           ctchecker.QMProxy
+	sshkey            string
+	sshport           int
+	sshfwport         int
+	sshuser           string
+	sshdir            string
 
 	faultInjectionEnabled    bool
 	comparisonTracingEnabled bool
@@ -136,17 +141,22 @@ func main() {
 	debug.SetGCPercent(50)
 
 	var (
-		flagName    = flag.String("name", "test", "unique name for manager")
-		flagOS      = flag.String("os", runtime.GOOS, "target OS")
-		flagArch    = flag.String("arch", runtime.GOARCH, "target arch")
-		flagManager = flag.String("manager", "", "manager rpc address")
-		flagProcs   = flag.Int("procs", 1, "number of parallel test processes")
-		flagOutput  = flag.String("output", "stdout", "write programs to none/stdout/dmesg/file")
-		flagTest    = flag.Bool("test", false, "enable image testing mode")                // used by syz-ci
-		flagRunTest = flag.Bool("runtest", false, "enable program testing mode")           // used by pkg/runtest
-		flagCC      = flag.Bool("cc", false, "container checker mode")                     // used by pkg/runtest
-		flagIndex   = flag.Int("index", 0, "index for fuzzer, used for container checker") // used by pkg/runtest
-		flagMon     = flag.Int("mon", 0, "QEMU monitor port")
+		flagName      = flag.String("name", "test", "unique name for manager")
+		flagOS        = flag.String("os", runtime.GOOS, "target OS")
+		flagArch      = flag.String("arch", runtime.GOARCH, "target arch")
+		flagManager   = flag.String("manager", "", "manager rpc address")
+		flagProcs     = flag.Int("procs", 1, "number of parallel test processes")
+		flagOutput    = flag.String("output", "stdout", "write programs to none/stdout/dmesg/file")
+		flagTest      = flag.Bool("test", false, "enable image testing mode")      // used by syz-ci
+		flagRunTest   = flag.Bool("runtest", false, "enable program testing mode") // used by pkg/runtest
+		flagCC        = flag.Bool("cc", false, "container checker mode")           // used by pkg/runtest
+		flagIndex     = flag.Int("index", 0, "container checker mode: index for fuzzer, for finding the correct shm/pipe")
+		flagMon       = flag.Int("mon", 0, "container checker mode: QEMU monitor port, for sending QMP to e.g. reload VM")
+		flagSSHKey    = flag.String("sshkey", "", "container checker mode: guest ssh key, for starting executor server")
+		flagSSHPort   = flag.Int("sshport", 0, "container checker mode: guest ssh port, for starting executor server")
+		flagSSHFWPort = flag.Int("sshfwport", 0, "container checker mode: guest ssh forward port, for starting executor server")
+		flagSSHUser   = flag.String("sshuser", "", "container checker mode: guest ssh user, for starting executor server")
+		flagSSHDir    = flag.String("sshdir", "", "container checker mode: guest executor target directory, for starting executor server")
 	)
 	defer tool.Init()()
 	outputType := parseOutputType(*flagOutput)
@@ -247,7 +257,8 @@ func main() {
 		if r.CheckResult.Error != "" {
 			log.Fatalf("%v", r.CheckResult.Error)
 		}
-	} else {
+	} else if !*flagCC {
+		// TODO congyu: Maybe support this setup function?
 		if err = host.Setup(target, r.CheckResult.Features, featureFlags, config.Executor); err != nil {
 			log.Fatal(err)
 		}
@@ -281,6 +292,11 @@ func main() {
 		index:                    *flagIndex,
 		cc:                       *flagCC,
 		qmProxy:                  ctchecker.QMProxy{MonPort: *flagMon},
+		sshkey:                   *flagSSHKey,
+		sshport:                  *flagSSHPort,
+		sshfwport:                *flagSSHFWPort,
+		sshuser:                  *flagSSHUser,
+		sshdir:                   *flagSSHDir,
 	}
 	gateCallback := fuzzer.useBugFrames(r, *flagProcs)
 	fuzzer.gate = ipc.NewGate(2**flagProcs, gateCallback)
@@ -388,8 +404,14 @@ func (fuzzer *Fuzzer) pollLoop() {
 			}
 			stats := make(map[string]uint64)
 			for _, proc := range fuzzer.procs {
-				stats["exec total"] += atomic.SwapUint64(&proc.env.StatExecs, 0)
-				stats["executor restarts"] += atomic.SwapUint64(&proc.env.StatRestarts, 0)
+				if fuzzer.cc {
+					// TODO congyu: think about better counter
+					stats["exec total"] += atomic.SwapUint64(&proc.dEnv.StatExecs, 0)
+					stats["executor restarts"] += atomic.SwapUint64(&proc.dEnv.StatRestarts, 0)
+				} else {
+					stats["exec total"] += atomic.SwapUint64(&proc.env.StatExecs, 0)
+					stats["executor restarts"] += atomic.SwapUint64(&proc.env.StatRestarts, 0)
+				}
 			}
 			for stat := Stat(0); stat < StatCount; stat++ {
 				v := atomic.SwapUint64(&fuzzer.stats[stat], 0)

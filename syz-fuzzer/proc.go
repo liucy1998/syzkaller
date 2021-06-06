@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/syzkaller/pkg/cover"
+	"github.com/google/syzkaller/pkg/ctchecker"
 	"github.com/google/syzkaller/pkg/hash"
 	"github.com/google/syzkaller/pkg/ipc"
 	"github.com/google/syzkaller/pkg/log"
@@ -27,6 +28,8 @@ type Proc struct {
 	fuzzer            *Fuzzer
 	pid               int
 	env               *ipc.Env
+	aEnv              *ipc.Env
+	dEnv              *ipc.Env
 	rnd               *rand.Rand
 	execOpts          *ipc.ExecOpts
 	execOptsCover     *ipc.ExecOpts
@@ -36,14 +39,27 @@ type Proc struct {
 
 func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 	var env *ipc.Env
+	var aEnv, dEnv *ipc.Env
 	var err error
 	if fuzzer.cc {
-		env, err = ipc.MakeEnvCC(fuzzer.config, pid, fuzzer.index, true)
+		aEnv, err = ipc.MakeEnvCC(fuzzer.config, fuzzer.index, true)
+		if err != nil {
+			return nil, err
+		}
+		dEnv, err = ipc.MakeEnvCC(fuzzer.config, fuzzer.index, false)
+		if err != nil {
+			return nil, err
+		}
+		log.Logf(1, "Make image now!!")
+		err = ipc.MakeImageCC(fuzzer.sshkey, fuzzer.sshport, fuzzer.sshfwport, fuzzer.sshuser, fuzzer.sshdir, fuzzer.index, aEnv, dEnv, &fuzzer.qmProxy)
+		if err != nil {
+			return nil, err
+		}
 	} else {
 		env, err = ipc.MakeEnv(fuzzer.config, pid)
-	}
-	if err != nil {
-		return nil, err
+		if err != nil {
+			return nil, err
+		}
 	}
 	rnd := rand.New(rand.NewSource(time.Now().UnixNano() + int64(pid)*1e12))
 	execOptsNoCollide := *fuzzer.execOpts
@@ -61,6 +77,8 @@ func newProc(fuzzer *Fuzzer, pid int) (*Proc, error) {
 		execOptsCover:     &execOptsCover,
 		execOptsComps:     &execOptsComps,
 		execOptsNoCollide: &execOptsNoCollide,
+		aEnv:              aEnv,
+		dEnv:              dEnv,
 	}
 	return proc, nil
 }
@@ -283,6 +301,7 @@ func (proc *Proc) enqueueCallTriage(p *prog.Prog, flags ProgTypes, callIndex int
 }
 
 func (proc *Proc) executeRaw(opts *ipc.ExecOpts, p *prog.Prog, stat Stat) *ipc.ProgInfo {
+	proc.executeCC(proc.execOpts, p, p, StatCandidate)
 	if opts.Flags&ipc.FlagDedupCover == 0 {
 		log.Fatalf("dedup cover is not enabled")
 	}
@@ -305,7 +324,14 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, p *prog.Prog, stat Stat) *ipc.P
 		var hanged bool
 		var err error
 		if proc.fuzzer.cc {
-			output, info, hanged, err = proc.env.ExecCC(opts, p, proc.fuzzer.index, &proc.fuzzer.qmProxy)
+			emptyProg := &prog.Prog{
+				Target: p.Target,
+			}
+			proc.fuzzer.qmProxy.LoadSnapshot()
+			// attacker run an empty program
+			proc.aEnv.ExecCC(opts, emptyProg, proc.fuzzer.index)
+			// detector run the actual program
+			_, output, info, hanged, err = proc.dEnv.ExecCC(opts, p, proc.fuzzer.index)
 		} else {
 			output, info, hanged, err = proc.env.Exec(opts, p)
 		}
@@ -327,6 +353,132 @@ func (proc *Proc) executeRaw(opts *ipc.ExecOpts, p *prog.Prog, stat Stat) *ipc.P
 		log.Logf(2, "result hanged=%v: %s", hanged, output)
 		return info
 	}
+}
+
+func (proc *Proc) executeCC(opts *ipc.ExecOpts, pa, pd *prog.Prog, stat Stat) {
+	if opts.Flags&ipc.FlagDedupCover == 0 {
+		log.Fatalf("dedup cover is not enabled")
+	}
+	for _, call := range pd.Calls {
+		if !proc.fuzzer.choiceTable.Enabled(call.Meta.ID) {
+			fmt.Printf("executing disabled syscall %v\n", call.Meta.Name)
+			panic("disabled syscall")
+		}
+	}
+	for _, call := range pa.Calls {
+		if !proc.fuzzer.choiceTable.Enabled(call.Meta.ID) {
+			fmt.Printf("executing disabled syscall %v\n", call.Meta.Name)
+			panic("disabled syscall")
+		}
+	}
+
+	// Disable collide mode
+	newOpts := &ipc.ExecOpts{
+		Flags:     opts.Flags & ^ipc.FlagCollide,
+		FaultCall: opts.FaultCall,
+		FaultNth:  opts.FaultNth,
+	}
+
+	// Limit concurrency window and do leak checking once in a while.
+	ticket := proc.fuzzer.gate.Enter()
+	defer proc.fuzzer.gate.Leave(ticket)
+
+	atomic.AddUint64(&proc.fuzzer.stats[stat], 1)
+	var output []byte
+	var hanged bool
+	var err error
+	var dTracemem, aTracemem [][]byte
+	var dCandTrace, dTestTrace *ctchecker.ProgTrace
+	var equal bool
+	var reason string
+	for {
+		var trace *ctchecker.ProgTrace
+		emptyProg := &prog.Prog{
+			Target: pd.Target,
+		}
+		proc.fuzzer.qmProxy.LoadSnapshot()
+		// attacker run an empty program
+		proc.aEnv.ExecCC(newOpts, emptyProg, proc.fuzzer.index)
+		// detector run the actual program
+		dTracemem, output, _, hanged, err = proc.dEnv.ExecCC(newOpts, pd, proc.fuzzer.index)
+		if err != nil {
+			log.Logf(4, "fuzzer detected detector failure='%v' when dealing non-determinism, quit", err)
+			return
+		}
+		trace, err = ctchecker.ParseTrace(dTracemem)
+		if err != nil {
+			log.Logf(4, "fuzzer can not parse detector trace failure='%v' when dealing non-determinism, quit", err)
+			log.Logf(4, "trace 0:\n%v", string(dTracemem[0][:ctchecker.BufTrailingZero(dTracemem[0])]))
+			return
+		}
+		if dCandTrace == nil {
+			dCandTrace = trace
+			proc.fuzzer.qmProxy.LoadSnapshot()
+			aTracemem, output, _, hanged, err = proc.aEnv.ExecCC(newOpts, pa, proc.fuzzer.index)
+			if err != nil {
+				log.Logf(4, "fuzzer detected attacker failure='%v', quit", err)
+				return
+			}
+			log.Logf(2, "attacker result hanged=%v: %s", hanged, output)
+			dTracemem, output, _, hanged, err = proc.dEnv.ExecCC(newOpts, pd, proc.fuzzer.index)
+			if err != nil {
+				log.Logf(4, "fuzzer detected detector failure='%v', quit", err)
+				return
+			}
+			log.Logf(2, "detector result hanged=%v: %s", hanged, output)
+			dTestTrace, err = ctchecker.ParseTrace(dTracemem)
+			if err != nil {
+				log.Logf(4, "%v", err)
+				return
+			}
+			equal, reason = ctchecker.ProgTraceNDEqual(dCandTrace, dTestTrace)
+			if !equal {
+				continue
+			} else {
+				log.Logf(4, "Equal! Early quit!")
+				return
+			}
+		}
+		nomatch, updated := ctchecker.ProgTraceNDUpdate(dCandTrace, trace)
+		if nomatch {
+			log.Logf(4, "trace does not match")
+			return
+		}
+		if !updated {
+			break
+		}
+	}
+	dett := dCandTrace.DeterminSerialze()
+	log.Logf(4, "DETERMINISM trace:\n%v\n", string(dett))
+
+	equal, reason = ctchecker.ProgTraceNDEqual(dCandTrace, dTestTrace)
+	if equal {
+		return
+	}
+	// send program & trace to manager
+	var atrace *ctchecker.ProgTrace
+	atrace, err = ctchecker.ParseTrace(aTracemem)
+	if err != nil {
+		log.Logf(4, "fuzzer can not compare attacker trace failure='%v' when sending report, quit", err)
+		return
+	}
+	r := &rpctype.CCReportArgs{
+		Name: proc.fuzzer.name,
+		CCReport: rpctype.CCReport{
+			AProg:         pa.Serialize(),
+			DProg:         pd.Serialize(),
+			ATrace:        atrace.RawSerialze(),
+			DTraceCandRaw: dCandTrace.RawSerialze(),
+			DTraceCandDet: dCandTrace.DeterminSerialze(),
+			DTraceTestRaw: dTestTrace.RawSerialze(),
+			Reason:        reason,
+		},
+	}
+	if err := proc.fuzzer.manager.Call("Manager.NewCCReport", r, nil); err != nil {
+		log.Fatalf("Manager.NewCCReport call failed: %v", err)
+	}
+	return
+
 }
 
 func (proc *Proc) logProgram(opts *ipc.ExecOpts, p *prog.Prog) {

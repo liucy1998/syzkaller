@@ -10,7 +10,9 @@ import (
 	"syscall"
 
 	"github.com/google/syzkaller/pkg/host"
+	"github.com/google/syzkaller/pkg/osutil"
 	"github.com/google/syzkaller/prog"
+	"github.com/google/syzkaller/vm/vmimpl"
 )
 
 type Shm struct {
@@ -73,24 +75,34 @@ func GetESFifoErr(index int) Fifo {
 func GetESFifoStatus(index int) Fifo {
 	return Fifo{Path: addPrefix(index, "es-fifo-status")}
 }
-func GetExecFifoIn(index int) Fifo {
-	return Fifo{Path: addPrefix(index, "fifo-in")}
+func GetExecFifoIn(index int, pid int) Fifo {
+	return Fifo{Path: addPrefix(index, "fifo-in"+fmt.Sprintf("-%v", pid))}
 }
-func GetExecFifoOut(index int) Fifo {
-	return Fifo{Path: addPrefix(index, "fifo-out")}
+func GetExecFifoOut(index int, pid int) Fifo {
+	return Fifo{Path: addPrefix(index, "fifo-out"+fmt.Sprintf("-%v", pid))}
 }
-func GetExecFifoErr(index int) Fifo {
-	return Fifo{Path: addPrefix(index, "fifo-err")}
+func GetExecFifoErr(index int, pid int) Fifo {
+	return Fifo{Path: addPrefix(index, "fifo-err"+fmt.Sprintf("-%v", pid))}
 }
 func GetESShmCmd(index int) Shm {
 	return Shm{Path: addPrefix(index, "es-shm-cmd"), Size: 4 << 20}
 }
-func GetExecShmProg(index int) Shm {
-	return Shm{Path: addPrefix(index, "shm-prog"), Size: prog.ExecBufferSize}
+func GetExecShmProg(index int, pid int) Shm {
+	return Shm{Path: addPrefix(index, "shm-prog"+fmt.Sprintf("-%v", pid)), Size: prog.ExecBufferSize}
 }
-func GetExecShmCov(index int) Shm {
-	return Shm{Path: addPrefix(index, "shm-cov"), Size: 16 << 20} // keep sync with ipc.outputSize
+func GetExecShmCov(index int, pid int) Shm {
+	return Shm{Path: addPrefix(index, "shm-cov"+fmt.Sprintf("-%v", pid)), Size: 16 << 20} // keep sync with ipc.outputSize
 }
+
+const NumThread = 16
+
+func GetExecShmTrace(index int, pid int) Shm {
+	return Shm{Path: addPrefix(index, fmt.Sprintf("shm-trace-%v", pid)), Size: (8 << 20) * NumThread}
+}
+
+const AttackerPid = 0
+const DetectorPid = 1
+
 func (fifo *Fifo) Open() (f *os.File, err error) {
 	f, err = os.OpenFile(fifo.Path, os.O_RDWR, 0666)
 	if err != nil {
@@ -123,15 +135,22 @@ func GetFifosShms(index int) ([]Fifo, []Shm) {
 		GetESFifoOut(index),
 		GetESFifoErr(index),
 		GetESFifoStatus(index),
-		GetExecFifoIn(index),
-		GetExecFifoOut(index),
-		GetExecFifoErr(index),
+		GetExecFifoIn(index, AttackerPid),
+		GetExecFifoOut(index, AttackerPid),
+		GetExecFifoErr(index, AttackerPid),
+		GetExecFifoIn(index, DetectorPid),
+		GetExecFifoOut(index, DetectorPid),
+		GetExecFifoErr(index, DetectorPid),
 	}
 
 	shms := []Shm{
 		GetESShmCmd(index),
-		GetExecShmProg(index),
-		GetExecShmCov(index),
+		GetExecShmProg(index, AttackerPid),
+		GetExecShmCov(index, AttackerPid),
+		GetExecShmTrace(index, AttackerPid),
+		GetExecShmProg(index, DetectorPid),
+		GetExecShmCov(index, DetectorPid),
+		GetExecShmTrace(index, DetectorPid),
 	}
 
 	return fifos, shms
@@ -242,7 +261,15 @@ func (r *ESExecReq) Print() {
 	fmt.Fprintf(os.Stderr, "Envp: %v\n", r.Envp)
 }
 
-func Start(p *ESProxy, bin string, args []string, extraEnv []string) (pid int32, status chan int32) {
+func Start(sshKey string, sshPort, sshFWPort int, sshUser, sshDir string, p *ESProxy, bin string, args []string, extraEnv []string) (pid int32, status chan int32, err error) {
+	sshArgs := vmimpl.SSHArgsForward(false, sshKey, sshPort, sshFWPort)
+	esargs := []string{"ssh"}
+	esargs = append(esargs, sshArgs...)
+	esargs = append(esargs, sshUser+"@localhost", "cd "+sshDir+" && "+"nohup ./executor_server > foo.out 2> foo.err < /dev/null &")
+	cmd := osutil.Command(esargs[0], esargs[1:]...)
+	if err = cmd.Start(); err != nil {
+		return
+	}
 	execreq := &ESExecReq{
 		Head: ESExecReqHead{
 			ArgvNum: len(args),

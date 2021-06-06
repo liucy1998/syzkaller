@@ -11,6 +11,19 @@ import (
 	"github.com/google/syzkaller/pkg/signal"
 )
 
+type CCReport struct {
+	AProg         []byte
+	DProg         []byte
+	ATrace        []byte
+	DTraceCandRaw []byte
+	DTraceCandDet []byte
+	DTraceTestRaw []byte
+	Reason        string
+}
+type CCReportArgs struct {
+	Name string
+	CCReport
+}
 type RPCInput struct {
 	Call   string
 	Prog   []byte

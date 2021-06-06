@@ -1099,6 +1099,42 @@ func (mgr *Manager) machineChecked(a *rpctype.CheckArgs, enabledSyscalls map[*pr
 	mgr.firstConnect = time.Now()
 }
 
+func (mgr *Manager) newCCReport(r *rpctype.CCReport) {
+	mgr.mu.Lock()
+	defer mgr.mu.Unlock()
+	fn := time.Now().Format("2006-01-02-15:04:05") + fmt.Sprintf("__%3d", rand.Intn(1000))
+	log.Logf(0, "Receiving detector report %v", fn)
+	f, err := os.Create(fn)
+	defer f.Close()
+	if err != nil {
+		log.Logf(0, "Create file: %v", err)
+		return
+	}
+	f.WriteString(fmt.Sprintf("Reason:\n%v\n", r.Reason))
+	f.WriteString(`***************************************
+				   *                                     *
+				   *              Attacker               *
+				   *                                     *
+				   ***************************************` + "\n")
+	f.WriteString("\n[       PROGRAM       ]\n")
+	f.Write(r.AProg)
+	f.WriteString("\n[      RAW TRACE      ]\n")
+	f.Write(r.ATrace)
+	f.WriteString(`***************************************
+				   *                                     *
+				   *              Detector               *
+				   *                                     *
+				   ***************************************` + "\n")
+	f.WriteString("\n[       PROGRAM       ]\n")
+	f.Write(r.DProg)
+	f.WriteString("\n[   RAW TRACE (CAND)  ]\n")
+	f.Write(r.DTraceCandRaw)
+	f.WriteString("\n[   DET TRACE (CAND)  ]\n")
+	f.Write(r.DTraceCandDet)
+	f.WriteString("\n[   RAW TRACE (TEST)  ]\n")
+	f.Write(r.DTraceTestRaw)
+	f.WriteString("\n")
+}
 func (mgr *Manager) newInput(inp rpctype.RPCInput, sign signal.Signal) bool {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()

@@ -105,10 +105,12 @@ type ProgInfo struct {
 type Env struct {
 	in  []byte
 	out []byte
+	trs [][]byte
 
 	cmd       *command
 	inFile    *os.File
 	outFile   *os.File
+	trFile    *os.File
 	bin       []string
 	linkedBin string
 	pid       int
@@ -715,6 +717,7 @@ func (c *command) handshake() error {
 }
 
 func (c *command) handshakeError(err error) error {
+	// TODO congyu: this Kill() is buggy...
 	c.cmd.Process.Kill()
 	output := <-c.readDone
 	err = fmt.Errorf("executor %v: %v\n%s", c.pid, err, output)
@@ -833,7 +836,7 @@ func (c *command) exec(opts *ExecOpts, progData []byte) (output []byte, hanged b
 	return
 }
 
-func MakeEnvCC(config *Config, pid int, index int, attacker bool) (*Env, error) {
+func MakeEnvCC(config *Config, index int, attacker bool) (*Env, error) {
 	if config.Timeouts.Slowdown == 0 || config.Timeouts.Scale == 0 ||
 		config.Timeouts.Syscall == 0 || config.Timeouts.Program == 0 {
 		return nil, fmt.Errorf("ipc.MakeEnv: uninitialized timeouts (%+v)", config.Timeouts)
@@ -841,7 +844,13 @@ func MakeEnvCC(config *Config, pid int, index int, attacker bool) (*Env, error) 
 	var inf, outf *os.File
 	var inmem, outmem []byte
 	var err error
-	exec_shm_prog := ctchecker.GetExecShmProg(index)
+	var pid int
+	if attacker {
+		pid = ctchecker.AttackerPid
+	} else {
+		pid = ctchecker.DetectorPid
+	}
+	exec_shm_prog := ctchecker.GetExecShmProg(index, pid)
 	inf, inmem, err = exec_shm_prog.Open()
 	if err != nil {
 		return nil, err
@@ -851,7 +860,7 @@ func MakeEnvCC(config *Config, pid int, index int, attacker bool) (*Env, error) 
 			osutil.CloseMemMappedFile(inf, inmem)
 		}
 	}()
-	exec_shm_cov := ctchecker.GetExecShmCov(index)
+	exec_shm_cov := ctchecker.GetExecShmCov(index, pid)
 	outf, outmem, err = exec_shm_cov.Open()
 	if err != nil {
 		return nil, err
@@ -861,11 +870,20 @@ func MakeEnvCC(config *Config, pid int, index int, attacker bool) (*Env, error) 
 			osutil.CloseMemMappedFile(outf, outmem)
 		}
 	}()
+	traceShm := ctchecker.GetExecShmTrace(index, pid)
+	trfile, trmem, err := traceShm.Open()
+	trmems := [][]byte{}
+	sizePerThread := traceShm.Size / ctchecker.NumThread
+	for i := 0; i < ctchecker.NumThread; i++ {
+		trmems = append(trmems, trmem[i*sizePerThread:(i+1)*sizePerThread])
+	}
 	env := &Env{
 		in:      inmem,
 		out:     outmem,
+		trs:     trmems,
 		inFile:  inf,
 		outFile: outf,
+		trFile:  trfile,
 		// hard-coded executor path here
 		bin:    []string{"./syz-executor"},
 		pid:    pid,
@@ -881,8 +899,8 @@ func MakeEnvCC(config *Config, pid int, index int, attacker bool) (*Env, error) 
 	return env, nil
 }
 
-func makeCommandCC(pid int, bin []string, config *Config, outmem []byte,
-	index int, qp *ctchecker.QMProxy) (*command, error) {
+func makeCommandCC(sshKey string, sshPort, sshFWPort int, sshUser, sshDir string, pid int, bin []string, config *Config, outmem []byte,
+	index int) (*command, error) {
 	// randBytes := make([]byte, 32)
 	// rand.Read(randBytes)
 	// path.Join(tmpDirPath, "syzkaller-testdir-", hex.EncodeToString(randBytes))
@@ -928,11 +946,11 @@ func makeCommandCC(pid int, bin []string, config *Config, outmem []byte,
 	// }
 
 	// Output capture pipe.
-	errfifo := ctchecker.GetExecFifoErr(index)
+	errfifo := ctchecker.GetExecFifoErr(index, pid)
 	c.errrp, err = errfifo.Open()
 
 	// executor->ipc command pipe.
-	outfifo := ctchecker.GetExecFifoOut(index)
+	outfifo := ctchecker.GetExecFifoOut(index, pid)
 	inrp, err := outfifo.Open()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pipe: %v", err)
@@ -940,7 +958,7 @@ func makeCommandCC(pid int, bin []string, config *Config, outmem []byte,
 	c.inrp = inrp
 
 	// ipc->executor command pipe.
-	infifo := ctchecker.GetExecFifoIn(index)
+	infifo := ctchecker.GetExecFifoIn(index, pid)
 	outwp, err := infifo.Open()
 	if err != nil {
 		return nil, fmt.Errorf("failed to create pipe: %v", err)
@@ -951,8 +969,12 @@ func makeCommandCC(pid int, bin []string, config *Config, outmem []byte,
 	c.exited = make(chan struct{})
 
 	extraenv := []string{"ASAN_OPTIONS=handle_segv=0 allow_user_segv_handler=1"}
-	c.ospid, c.status = ctchecker.Start(c.esproxy, bin[0], bin[0:], extraenv)
+	c.ospid, c.status, err = ctchecker.Start(sshKey, sshPort, sshFWPort, sshUser, sshDir, c.esproxy, bin[0], bin[0:], extraenv)
+	if err != nil {
+		return nil, err
+	}
 	fmt.Fprintf(os.Stderr, "executor ospid = %v\n", c.ospid)
+	// TODO congyu: when executor hangs, goroutines below will terminate. Restart them later.
 	if config.Flags&FlagDebug != 0 {
 		close(c.readDone)
 		go io.Copy(os.Stdout, c.errrp)
@@ -989,13 +1011,26 @@ func makeCommandCC(pid int, bin []string, config *Config, outmem []byte,
 		}
 	}
 
+	tmp := c
+	c = nil // disable defer above
+	return tmp, nil
+}
+
+func MakeImageCC(sshKey string, sshPort, sshFWPort int, sshUser, sshDir string, index int, aEnv, dEnv *Env, qp *ctchecker.QMProxy) (err error) {
+	aEnv.cmd, err = makeCommandCC(sshKey, sshPort, sshFWPort, sshUser, sshDir, aEnv.pid, aEnv.bin, aEnv.config, aEnv.out, index)
+	if err != nil {
+		return
+	}
+	dEnv.cmd, err = makeCommandCC(sshKey, sshPort, sshFWPort, sshUser, sshDir, dEnv.pid, dEnv.bin, dEnv.config, dEnv.out, index)
+	if err != nil {
+		return
+	}
+
 	// wait 2 seconds for VM stop
 	time.Sleep(time.Duration(2) * time.Second)
 	qp.SaveSnapshot()
 
-	tmp := c
-	c = nil // disable defer above
-	return tmp, nil
+	return
 }
 
 // Exec starts executor binary to execute program p and returns information about the execution:
@@ -1003,7 +1038,8 @@ func makeCommandCC(pid int, bin []string, config *Config, outmem []byte,
 // info: per-call info
 // hanged: program hanged and was killed
 // err0: failed to start the process or bug in executor itself.
-func (env *Env) ExecCC(opts *ExecOpts, p *prog.Prog, index int, qp *ctchecker.QMProxy) (output []byte, info *ProgInfo, hanged bool, err0 error) {
+func (env *Env) ExecCC(opts *ExecOpts, p *prog.Prog, index int) (trmems [][]byte, output []byte, info *ProgInfo, hanged bool, err0 error) {
+	trmems = env.trs
 	// Copy-in serialized program.
 	progSize, err := p.SerializeForExec(env.in)
 	if err != nil {
@@ -1020,34 +1056,26 @@ func (env *Env) ExecCC(opts *ExecOpts, p *prog.Prog, index int, qp *ctchecker.QM
 		env.out[i] = 0
 	}
 
-	atomic.AddUint64(&env.StatExecs, 1)
-	if env.cmd == nil {
-		if p.Target.OS != targets.TestOS && targets.Get(p.Target.OS, p.Target.Arch).HostFuzzer {
-			// The executor is actually ssh,
-			// starting them too frequently leads to timeouts.
-			<-rateLimit.C
-		}
-		// tmpDirPath := "./"
-		atomic.AddUint64(&env.StatRestarts, 1)
-
-		fmt.Fprintf(os.Stderr, "Now try to start executor...\n")
-		env.cmd, err0 = makeCommandCC(env.pid, env.bin, env.config, env.out, index, qp)
-		if err0 != nil {
-			return
-		}
+	// Clear the trace buffer
+	for i := 0; i < ctchecker.NumThread; i++ {
+		env.trs[i][0] = 0
 	}
+
+	atomic.AddUint64(&env.StatExecs, 1)
+
 	output, hanged, err0 = env.cmd.execCC(opts, progData)
-	qp.LoadSnapshot()
+
 	if hanged {
+		// TODO congyu: do fault injections in executor and test if this handling works well.
 		// Reopen pipes
 
 		// Output capture pipe.
-		errfifo := ctchecker.GetExecFifoErr(index)
+		errfifo := ctchecker.GetExecFifoErr(index, env.pid)
 		rp, _ := errfifo.Open()
 		env.cmd.errrp = rp
 
 		// executor->ipc command pipe.
-		outfifo := ctchecker.GetExecFifoOut(index)
+		outfifo := ctchecker.GetExecFifoOut(index, env.pid)
 		inrp, _ := outfifo.Open()
 		env.cmd.inrp = inrp
 	}
@@ -1061,10 +1089,6 @@ func (env *Env) ExecCC(opts *ExecOpts, p *prog.Prog, index int, qp *ctchecker.QM
 		addFallbackSignal(p, info)
 	}
 
-	// Assume we must use fork server
-	// if !env.config.UseForkServer {
-
-	// }
 	return
 }
 

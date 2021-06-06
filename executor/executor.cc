@@ -22,6 +22,8 @@
 #include "defs.h"
 #include "ipc_shim.h"
 #include "executor_server.h"
+#include "libsclog.h"
+#include <fcntl.h>
 
 #if defined(__GNUC__)
 #define SYSCALLAPI
@@ -72,6 +74,10 @@ const int kMaxThreads = 16;
 const int kInPipeFd = kMaxFd - 1; // remapped from stdin
 const int kOutPipeFd = kMaxFd - 2; // remapped from stdout
 const int kCoverFd = kOutPipeFd - kMaxThreads;
+#if CONTAINER_CHECKER
+const int kOutSyncFd = kCoverFd - 1;
+const int kInSyncFd = kCoverFd - 2;
+#endif
 const int kMaxArgs = 9;
 const int kCoverSize = 256 << 10;
 const int kFailStatus = 67;
@@ -165,6 +171,7 @@ static uint64 syscall_timeout_ms;
 static uint64 program_timeout_ms;
 static uint64 slowdown_scale;
 
+static bool attacker;
 #define SYZ_EXECUTOR 1
 #include "common.h"
 
@@ -381,18 +388,43 @@ static int out_pipe;
 static int err_pipe;
 static int prog_shm;
 static int cov_shm;
+static int trace_shm;
+static char* trace_buf[16];
+#define TRACE_SHM_SIZE (8<<20)
+#define FIFO_A2D "./a2d"
+#define FIFO_D2A "./d2a"
 static void set_pipe_shm(int idx) {
 	int pipe_base = EXECUTOR_PIPE_BASE + idx*3;
-	int shm_base = EXECUTOR_SHM_BASE + idx*2;
+	int shm_base = EXECUTOR_SHM_BASE + idx*3;
 
 	in_pipe = pipe_base + 0;
 	out_pipe = pipe_base + 1;
 	err_pipe = pipe_base + 2;
 	prog_shm = shm_base + 0;
 	cov_shm = shm_base + 1;
+	trace_shm = shm_base + 2;
 }
+
+static void init_syscall_trace() {
+	init_sclog();
+	for (int i = 0; i < 16; i++) {
+		FILE *f;
+		void *addr = mmap(NULL, TRACE_SHM_SIZE, PROT_READ|PROT_WRITE, MAP_SHARED|MAP_ANON, -1, 0);
+		if (addr == (void *)-1) {
+			fail("mmap syscall trace");
+		}
+		f = fmemopen(addr, TRACE_SHM_SIZE, "r+");
+		if (f == NULL) {
+			fail("fmemopen");
+		}
+		set_log_file(i, f);
+		trace_buf[i] = (char *)addr;
+	}
+}
+
 int main(int argc, char** argv)
 {
+	// TODO: turn down all reset
 	if (argc == 2 && strcmp(argv[1], "version") == 0) {
 		puts(GOOS " " GOARCH " " SYZ_REVISION " " GIT_REVISION);
 		return 0;
@@ -422,12 +454,54 @@ int main(int argc, char** argv)
 
 #if CONTAINER_CHECKER
 	if (argc == 2 && strcmp(argv[1], "attacker") == 0) {
+		int fifo_fd;
+
+		attacker = true;
 		set_pipe_shm(0);
+		if (mkfifo(FIFO_A2D, 0666) < 0) {
+			fail("mkfifo");
+		}
+		if (mkfifo(FIFO_D2A, 0666) < 0) {
+			fail("mkfifo");
+		}
+		// Since detector is not started , must use O_RDWR or we will block here forever
+		if ((fifo_fd=open(FIFO_A2D, O_RDWR)) == -1) {
+			debug("fuck\n");
+			fail("open fifo");
+		}
+		if (dup2(fifo_fd, kOutSyncFd) == -1) {
+			fail("dup2");
+		}
+		close(fifo_fd);
+		if ((fifo_fd=open(FIFO_D2A, O_RDWR)) == -1) {
+			fail("open fifo");
+		}
+		if (dup2(fifo_fd, kInSyncFd) == -1) {
+			fail("dup2");
+		}
+		close(fifo_fd);
 	}
 	if (argc == 2 && strcmp(argv[1], "detector") == 0) {
+		int fifo_fd;
+
+		attacker = false;
 		set_pipe_shm(1);
+		if ((fifo_fd=open(FIFO_D2A, O_WRONLY)) == -1) {
+			fail("open fifo");
+		}
+		if (dup2(fifo_fd, kOutSyncFd) == -1) {
+			fail("dup2");
+		}
+		close(fifo_fd);
+		if ((fifo_fd=open(FIFO_A2D, O_RDONLY)) == -1) {
+			fail("open fifo");
+		}
+		if (dup2(fifo_fd, kInSyncFd) == -1) {
+			fail("dup2");
+		}
+		close(fifo_fd);
 	}
-	debug("syz-executor %s starts successfully!", argv[1]);
+	init_syscall_trace();
  
 #endif
 
@@ -931,6 +1005,23 @@ retry:
 		collide = colliding = true;
 		goto retry;
 	}
+#if SYZ_EXECUTOR_USES_SHMEM
+#if CONTAINER_CHECKER
+		// Sync syscall trace
+		for (int i = 0; i < 16; i++) {
+			int sz = get_trace_size(i);
+			if (sz == TRACE_SHM_SIZE) {
+				sz--;
+			}
+			trace_buf[i][sz] = 0;
+			// Fuzzer must clean the shm if we do not write
+			// We don't do cleaning because hypercall is too expensive
+			if (sz > 0) {
+				write_host_shm_safe(trace_shm, i*TRACE_SHM_SIZE, (void *)trace_buf[i], sz+1);
+			}
+		}
+#endif
+#endif
 }
 
 thread_t* schedule_call(int call_index, int call_num, bool colliding, uint64 copyout_index, uint64 num_args, uint64* args, uint64* pos)
@@ -1263,8 +1354,20 @@ void execute_call(thread_t* th)
 	// Arrange for res = -1 and errno = EFAULT result for such case.
 	th->res = -1;
 	errno = EFAULT;
+#if CONTAINER_CHECKER
+	int idx = ((long)th-(long)threads)/sizeof(struct thread_t);
+	if(!call->call) {
+		// use for sorting
+		log_syscall_with_index(idx, th->call_index, call->sys_nr, th->num_args, th->args, th->res, th->reserrno, true);
+	}
+#endif
 	NONFAILING(th->res = execute_syscall(call, th->args));
 	th->reserrno = errno;
+#if CONTAINER_CHECKER
+	if(!call->call) {
+		log_syscall_with_index(idx, th->call_index, call->sys_nr, th->num_args, th->args, th->res, th->reserrno, false);
+	}
+#endif
 	// Our pseudo-syscalls may misbehave.
 	if ((th->res == -1 && th->reserrno == 0) || call->attrs.ignore_return)
 		th->reserrno = EINVAL;

@@ -590,24 +590,21 @@ func (inst *instance) Run(timeout time.Duration, stop <-chan bool, command strin
 
 	sshArgs := vmimpl.SSHArgsForward(inst.debug, inst.sshkey, inst.port, inst.forwardPort)
 	if inst.cfg.ContainerChecker {
-		// start executor server, this will block the VM
+		// redirect output of executor server stderr pipe
 		errfifo := ctchecker.GetESFifoErr(inst.index)
 		rp, _ := errfifo.Open()
 		go io.Copy(os.Stdout, rp)
-		esargs := []string{"ssh"}
-		esargs = append(esargs, sshArgs...)
-		esargs = append(esargs, inst.sshuser+"@localhost", "cd "+inst.targetDir()+" && "+"nohup ./executor_server > foo.out 2> foo.err < /dev/null &")
-		cmd := osutil.Command(esargs[0], esargs[1:]...)
-		cmd.Dir = inst.workdir
-		if err := cmd.Start(); err != nil {
-			return nil, nil, err
-		}
 	}
 	args := strings.Split(command, " ")
 	if inst.cfg.ContainerChecker {
 		args = append(args, "-index="+strconv.FormatInt(int64(inst.index), 10))
 		args = append(args, "-cc=true")
 		args = append(args, "-mon="+strconv.FormatInt(int64(inst.monport), 10))
+		args = append(args, "-sshkey="+inst.sshkey)
+		args = append(args, "-sshport="+fmt.Sprintf("%v", inst.port))
+		args = append(args, "-sshfwport="+fmt.Sprintf("%v", inst.forwardPort))
+		args = append(args, "-sshuser="+inst.sshuser)
+		args = append(args, "-sshdir="+inst.targetDir())
 	}
 	if bin := filepath.Base(args[0]); (inst.target.HostFuzzer || inst.cfg.ContainerChecker) &&
 		(bin == "syz-fuzzer" || bin == "syz-execprog") {

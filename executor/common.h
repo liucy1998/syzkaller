@@ -597,7 +597,38 @@ static void loop(void)
 		reset_loop();
 #endif
 #if CONTAINER_CHECKER
-		stop_vm();
+		char x;
+		if (attacker) {
+			x = 'a';
+			if (write(kOutSyncFd, &x, 1) == -1) {
+				fail("write");
+			}
+			if (read(kInSyncFd, &x, 1) == -1) {
+				fail("write");
+			}
+			if (x != 'd') {
+				fail("fail to read from detector");
+			}
+			stop_vm();
+		}
+		else {
+			if (read(kInSyncFd, &x, 1) == -1) {
+				fail("read");
+			}
+			if (x != 'a') {
+				fail("fail to read from attacker");
+			}
+			x = 'd';
+			if (write(kOutSyncFd, &x, 1) == -1) {
+				fail("write");
+			}
+
+			// TODO: what if attacker exit?
+			// wait for attacker to finish
+			if (read(kInSyncFd, &x, 1) == -1) {
+				fail("read");
+			}
+		}
 #endif
 #if SYZ_EXECUTOR
 		receive_execute();
@@ -698,7 +729,18 @@ static void loop(void)
 		reply_execute(0);
 #endif
 #if CONTAINER_CHECKER
-		stop_vm();
+		if (attacker) {
+			x = 's';
+			if (write(kOutSyncFd, &x, 1) == -1) {
+				fail("write");
+			}
+			for(;;) {
+				pause();
+			}
+		}
+		else {
+			stop_vm();
+		}
 #endif
 #if SYZ_EXECUTOR || SYZ_USE_TMP_DIR
 		remove_dir(cwdbuf);

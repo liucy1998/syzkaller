@@ -191,40 +191,38 @@ static char input[ES_SHM_SIZE];
 int main(int argc , char *argv[], char *envp[]) {
     // TODO: pass pipe/shm index using argv 
     int i;
-    for (i = 0; i < 1; i++) {
-        struct Req r;
-        struct ExecReq er;
-        struct KillReq qr;
-        int env_idx, ret, pid;
+    struct Req r;
+    struct ExecReq er;
+    struct KillReq qr;
+    int env_idx, ret, pid;
 
-        recv_req(&r);
-        switch(r.command) {
-            case RUN_EXECUTOR:
-                ret = recv_execreq(input, ES_SHM_SIZE, &er);
-                if (ret < 0) {
-                    reply(-1);
-                    break;
-                }
-                pid = run_execreq(&er);
-                if (pid < 0) {
-                    reply(-2);
-                    break;
-                }
-                reply(pid);
+    recv_req(&r);
+    switch(r.command) {
+        case RUN_EXECUTOR:
+            ret = recv_execreq(input, ES_SHM_SIZE, &er);
+            if (ret < 0) {
+                reply(-1);
                 break;
-            case KILL_EXECUTOR:
-                recv_killreq(&qr);
-                ret = kill(SIGKILL, qr.pid);
-                if (ret < 0) {
-                    err("kill executor");
-                    reply(-1);
-                    break;
-                }
-                reply(0);
+            }
+            pid = run_execreq(&er);
+            if (pid < 0) {
+                reply(-2);
                 break;
-            default:
+            }
+            reply(pid);
+            break;
+        case KILL_EXECUTOR:
+            recv_killreq(&qr);
+            ret = kill(SIGKILL, qr.pid);
+            if (ret < 0) {
+                err("kill executor");
+                reply(-1);
                 break;
-        }
+            }
+            reply(0);
+            break;
+        default:
+            break;
     }
     return 0;
 }
