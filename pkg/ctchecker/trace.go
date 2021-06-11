@@ -889,6 +889,20 @@ func ProgTraceNDEqual(a, b *ProgTrace) (equal bool, reason string) {
 		return false, fmt.Sprintf("Number of traces %v & %v not match.", len(a.traces), len(b.traces))
 	}
 	for i, ta := range a.traces {
+		if ta.e.IsNil() && ta.nd {
+			continue
+		}
+		if b.traces[i].e.IsNil() && b.traces[i].nd {
+			continue
+		}
+		if ta.e.IsNil() || b.traces[i].e.IsNil() {
+			equal = (a.raw[i].trace == b.raw[i].trace)
+			if !equal {
+				reason = fmt.Sprintf("Trace #%v: compare raw trace", i)
+				return
+			}
+			continue
+		}
 		equal, reason = TraceNDEqual(ta, b.traces[i])
 		if !equal {
 			reason = fmt.Sprintf("Trace #%v:\n", i) + reason
@@ -905,6 +919,20 @@ func ProgTraceNDUpdate(cand *ProgTrace, b *ProgTrace) (nomatch bool, updated boo
 	}
 
 	for i, ta := range cand.traces {
+		if ta.e.IsNil() || b.traces[i].e.IsNil() {
+			if !ta.e.IsNil() {
+				var x *NdInfixExpr = nil
+				ta.e = x
+				ta.errno = nil
+				ta.nd = false
+				updated = true
+			}
+			if cand.raw[i].trace != b.raw[i].trace {
+				ta.nd = true
+				updated = true
+			}
+			continue
+		}
 		updated = updated || TraceNDUpdate(ta, b.traces[i])
 	}
 	return
@@ -927,8 +955,14 @@ func ParseTrace(buf [][]byte) (trace *ProgTrace, err error) {
 		}
 		traceLine, err = Parse(ts)
 		if err != nil {
-			err = fmt.Errorf("When parsing syscall trace:\n%v\nFound error:\n%v", raw.trace, err)
-			return
+			var x *NdInfixExpr = nil
+			traceLine = &NdTrace{
+				e:     x,
+				errno: nil,
+				nd:    false,
+			}
+			log.Logf(2, "Parse error: %v", err)
+			err = nil
 		}
 		trace.traces = append(trace.traces, traceLine)
 	}
@@ -947,7 +981,16 @@ func (trace *ProgTrace) RawSerialze() []byte {
 func (trace *ProgTrace) DeterminSerialze() []byte {
 	buf := new(bytes.Buffer)
 	for i, t := range trace.traces {
-		fmt.Fprintf(buf, "%v: %v\n", i, t.Serialze(true))
+		if t.e.IsNil() {
+			if t.nd {
+				fmt.Fprint(buf, "(RAW ND)")
+			} else {
+				fmt.Fprint(buf, "(RAW D)")
+			}
+			fmt.Fprintf(buf, "%v: %v\n", trace.raw[i].idx, trace.raw[i])
+		} else {
+			fmt.Fprintf(buf, "%v: %v\n", trace.raw[i].idx, t.Serialze(true))
+		}
 	}
 	return buf.Bytes()
 }
