@@ -21,6 +21,7 @@ import (
 	"github.com/google/syzkaller/dashboard/dashapi"
 	"github.com/google/syzkaller/pkg/cover"
 	"github.com/google/syzkaller/pkg/csource"
+	"github.com/google/syzkaller/pkg/ctchecker"
 	"github.com/google/syzkaller/pkg/db"
 	"github.com/google/syzkaller/pkg/gce"
 	"github.com/google/syzkaller/pkg/hash"
@@ -92,6 +93,10 @@ type Manager struct {
 	coverFilter        map[uint32]uint32
 	coverFilterBitmap  []byte
 	modulesInitialized bool
+
+	ifSigSetMu sync.RWMutex
+	ifSigSet   ctchecker.IFSignalSet
+	ifSigCnt   int
 }
 
 const (
@@ -173,6 +178,7 @@ func RunManager(cfg *mgrconfig.Config) {
 		reproRequest:     make(chan chan map[string]bool),
 		usedFiles:        make(map[string]time.Time),
 		saturatedCalls:   make(map[string]bool),
+		ifSigSet:         make(ctchecker.IFSignalSet),
 	}
 
 	mgr.preloadCorpus()
@@ -209,9 +215,12 @@ func RunManager(cfg *mgrconfig.Config) {
 			mgr.mu.Unlock()
 			numReproducing := atomic.LoadUint32(&mgr.numReproducing)
 			numFuzzing := atomic.LoadUint32(&mgr.numFuzzing)
+			mgr.ifSigSetMu.RLock()
+			numIFSig := mgr.ifSigCnt
+			mgr.ifSigSetMu.RUnlock()
 
-			log.Logf(0, "VMs %v, executed %v, cover %v, signal %v/%v, crashes %v, repro %v",
-				numFuzzing, executed, corpusCover, corpusSignal, maxSignal, crashes, numReproducing)
+			log.Logf(0, "VMs %v, executed %v, cover %v, signal %v/%v, crashes %v, repro %v, if sig %v",
+				numFuzzing, executed, corpusCover, corpusSignal, maxSignal, crashes, numReproducing, numIFSig)
 		}
 	}()
 
@@ -1099,6 +1108,12 @@ func (mgr *Manager) machineChecked(a *rpctype.CheckArgs, enabledSyscalls map[*pr
 	mgr.firstConnect = time.Now()
 }
 
+func (mgr *Manager) newIFSigalReport(r *rpctype.IFSigReport) {
+	mgr.ifSigSetMu.Lock()
+	mgr.ifSigCnt = mgr.ifSigSet.Merge(r.Sig, mgr.ifSigCnt)
+	defer mgr.ifSigSetMu.Unlock()
+}
+
 func (mgr *Manager) newCCReport(r *rpctype.CCReport) {
 	mgr.mu.Lock()
 	defer mgr.mu.Unlock()
@@ -1111,20 +1126,22 @@ func (mgr *Manager) newCCReport(r *rpctype.CCReport) {
 		return
 	}
 	f.WriteString(fmt.Sprintf("Reason:\n%v\n", r.Reason))
-	f.WriteString(`***************************************
-				   *                                     *
-				   *              Attacker               *
-				   *                                     *
-				   ***************************************` + "\n")
+	f.WriteString(
+		`***************************************
+*                                     *
+*              Attacker               *
+*                                     *
+***************************************` + "\n")
 	f.WriteString("\n[       PROGRAM       ]\n")
 	f.Write(r.AProg)
 	f.WriteString("\n[      RAW TRACE      ]\n")
 	f.Write(r.ATrace)
-	f.WriteString(`***************************************
-				   *                                     *
-				   *              Detector               *
-				   *                                     *
-				   ***************************************` + "\n")
+	f.WriteString(
+		`***************************************
+*                                     *
+*              Detector               *
+*                                     *
+***************************************` + "\n")
 	f.WriteString("\n[       PROGRAM       ]\n")
 	f.Write(r.DProg)
 	f.WriteString("\n[   RAW TRACE (CAND)  ]\n")
@@ -1133,7 +1150,16 @@ func (mgr *Manager) newCCReport(r *rpctype.CCReport) {
 	f.Write(r.DTraceCandDet)
 	f.WriteString("\n[   RAW TRACE (TEST)  ]\n")
 	f.Write(r.DTraceTestRaw)
-	f.WriteString("\n")
+	f.WriteString(
+		`***************************************
+*                                     *
+*               Config                *
+*                                     *
+***************************************` + "\n")
+	f.WriteString("EnvFlags: " + fmt.Sprintf("%x", r.EnvFlags) + "\n")
+	f.WriteString("ExecFlags: " + fmt.Sprintf("%x", r.ExecFlags) + "\n")
+	f.WriteString("FaultCall: " + fmt.Sprintf("%d", r.FaultCall) + "\n")
+	f.WriteString("FaultNth: " + fmt.Sprintf("%d", r.FaultNth) + "\n")
 }
 func (mgr *Manager) newInput(inp rpctype.RPCInput, sign signal.Signal) bool {
 	mgr.mu.Lock()

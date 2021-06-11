@@ -6,11 +6,19 @@
 package rpctype
 
 import (
+	"github.com/google/syzkaller/pkg/ctchecker"
 	"github.com/google/syzkaller/pkg/host"
 	"github.com/google/syzkaller/pkg/ipc"
 	"github.com/google/syzkaller/pkg/signal"
 )
 
+type IFSigReport struct {
+	Sig []ctchecker.IFSignal
+}
+type IFSigReportArgs struct {
+	Name string
+	IFSigReport
+}
 type CCReport struct {
 	AProg         []byte
 	DProg         []byte
@@ -19,6 +27,10 @@ type CCReport struct {
 	DTraceCandDet []byte
 	DTraceTestRaw []byte
 	Reason        string
+	EnvFlags      uint64
+	ExecFlags     uint64
+	FaultCall     int
+	FaultNth      int
 }
 type CCReportArgs struct {
 	Name string

@@ -69,6 +69,10 @@ type Fuzzer struct {
 	maxSignal    signal.Signal // max signal ever observed including flakes
 	newSignal    signal.Signal // diff of maxSignal since last sync with master
 
+	ifSignalMu     sync.RWMutex
+	detIFSignalSet ctchecker.IFSignalSet
+	ifSigCnt       int
+
 	logMu sync.Mutex
 }
 
@@ -297,6 +301,7 @@ func main() {
 		sshfwport:                *flagSSHFWPort,
 		sshuser:                  *flagSSHUser,
 		sshdir:                   *flagSSHDir,
+		detIFSignalSet:           make(ctchecker.IFSignalSet),
 	}
 	gateCallback := fuzzer.useBugFrames(r, *flagProcs)
 	fuzzer.gate = ipc.NewGate(2**flagProcs, gateCallback)

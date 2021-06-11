@@ -389,13 +389,143 @@ func (proc *Proc) executeCC(opts *ipc.ExecOpts, pa, pd *prog.Prog, stat Stat) {
 	var err error
 	var dTracemem, aTracemem [][]byte
 	var dCandTrace, dTestTrace *ctchecker.ProgTrace
-	var equal bool
+	var traceEqual, sigEqual bool
 	var reason string
+	// var dInfo, dCandInfo, dTestInfo *ipc.ProgInfo
+	// send program & trace to manager
+	var atrace *ctchecker.ProgTrace
+
+	var dCandRawSig, dTestRawSig []uint32
+	var pInfo *ipc.ProgInfo
+	var newIFSig []ctchecker.IFSignal
+
+	emptyProg := &prog.Prog{
+		Target: pd.Target,
+	}
+	proc.fuzzer.qmProxy.LoadSnapshot()
+	// attacker run an empty program
+	proc.aEnv.ExecCC(newOpts, emptyProg, proc.fuzzer.index)
+	// detector run the actual program
+	dTracemem, output, pInfo, hanged, err = proc.dEnv.ExecCC(newOpts, pd, proc.fuzzer.index)
+	if err != nil {
+		log.Logf(4, "fuzzer detected detector failure='%v', quit", err)
+		return
+	}
+	dCandTrace, err = ctchecker.ParseTrace(dTracemem)
+	if err != nil {
+		log.Logf(4, "fuzzer can not parse detector trace failure='%v', quit", err)
+		log.Logf(4, "trace 0:\n%v", string(dTracemem[0][:ctchecker.BufTrailingZero(dTracemem[0])]))
+		return
+	}
+	for _, call := range pInfo.Calls {
+		dCandRawSig = append(dCandRawSig, call.Signal...)
+	}
+	dCandRawSig = append(dCandRawSig, pInfo.Extra.Signal...)
+
+	proc.fuzzer.qmProxy.LoadSnapshot()
+	aTracemem, output, _, hanged, err = proc.aEnv.ExecCC(newOpts, pa, proc.fuzzer.index)
+	if err != nil {
+		log.Logf(4, "fuzzer detected attacker failure='%v', quit", err)
+		return
+	}
+	log.Logf(2, "attacker result hanged=%v: %s", hanged, output)
+	dTracemem, output, pInfo, hanged, err = proc.dEnv.ExecCC(newOpts, pd, proc.fuzzer.index)
+	if err != nil {
+		log.Logf(4, "fuzzer detected detector failure='%v', quit", err)
+		return
+	}
+	log.Logf(2, "detector result hanged=%v: %s", hanged, output)
+	dTestTrace, err = ctchecker.ParseTrace(dTracemem)
+	if err != nil {
+		log.Logf(4, "%v", err)
+		return
+	}
+	for _, call := range pInfo.Calls {
+		dTestRawSig = append(dTestRawSig, call.Signal...)
+	}
+	dTestRawSig = append(dTestRawSig, pInfo.Extra.Signal...)
+
+	traceEqual, reason = ctchecker.ProgTraceNDEqual(dCandTrace, dTestTrace)
+	if !traceEqual {
+		// We must parse attacker trace now,
+		// or the buffer will be cleared in next non-determinism reduction executions
+		atrace, err = ctchecker.ParseTrace(aTracemem)
+		if err != nil {
+			log.Logf(4, "fuzzer can not compare attacker trace failure='%v' when sending report, quit", err)
+			return
+		}
+	}
+
+	ifSig := ctchecker.GenIFSigal(dCandRawSig, dTestRawSig)
+	proc.fuzzer.ifSignalMu.RLock()
+	sigEqual = !proc.fuzzer.detIFSignalSet.CheckNew(ifSig)
+	proc.fuzzer.ifSignalMu.RUnlock()
+
+	if traceEqual && sigEqual {
+		log.Logf(4, "Equal! Early quit!")
+		return
+	}
+	if !sigEqual {
+		log.Logf(0, "Number of ifsig: %v", len(ifSig))
+		log.Logf(0, "IFSIG: %v", ifSig)
+	}
+
+	log.Logf(0, "CC execution: stage A-D non-determinisim")
+	// handling A-D non-determinism
+	var dTestTraceNDOk, dTestSigNDOk bool
 	for {
 		var trace *ctchecker.ProgTrace
-		emptyProg := &prog.Prog{
-			Target: pd.Target,
+		proc.fuzzer.qmProxy.LoadSnapshot()
+		_, output, _, hanged, err = proc.aEnv.ExecCC(newOpts, pa, proc.fuzzer.index)
+		if err != nil {
+			log.Logf(4, "fuzzer detected attacker failure='%v', quit", err)
+			return
 		}
+		log.Logf(2, "attacker result hanged=%v: %s", hanged, output)
+		dTracemem, output, pInfo, hanged, err = proc.dEnv.ExecCC(newOpts, pd, proc.fuzzer.index)
+		if err != nil {
+			log.Logf(4, "fuzzer detected detector failure='%v', quit", err)
+			return
+		}
+		log.Logf(2, "detector result hanged=%v: %s", hanged, output)
+		if !traceEqual && !dTestTraceNDOk {
+			trace, err = ctchecker.ParseTrace(dTracemem)
+			if err != nil {
+				log.Logf(4, "%v", err)
+				return
+			}
+			nomatch, updated := ctchecker.ProgTraceNDUpdate(dTestTrace, trace)
+			if nomatch {
+				log.Logf(4, "trace does not match")
+				return
+			}
+			if !updated {
+				dTestTraceNDOk = true
+			}
+		}
+		if !sigEqual && !dTestSigNDOk {
+			var tmpSig []uint32
+			for _, call := range pInfo.Calls {
+				tmpSig = append(tmpSig, call.Signal...)
+			}
+			tmpSig = append(tmpSig, pInfo.Extra.Signal...)
+			tmpSig = ctchecker.RawSigIntersection(dTestRawSig, tmpSig)
+			if len(tmpSig) == len(dTestRawSig) {
+				// Successfully filter non-deterministic signals
+				dTestSigNDOk = true
+			}
+			dTestRawSig = tmpSig
+		}
+		if (traceEqual != dTestTraceNDOk) && (sigEqual != dTestSigNDOk) {
+			break
+		}
+	}
+
+	log.Logf(0, "CC execution: stage D non-determinisim")
+	// handling D non-determinism
+	var dCandTraceNDOk, dCandSigNDOk bool
+	for {
+		var trace *ctchecker.ProgTrace
 		proc.fuzzer.qmProxy.LoadSnapshot()
 		// attacker run an empty program
 		proc.aEnv.ExecCC(newOpts, emptyProg, proc.fuzzer.index)
@@ -405,77 +535,98 @@ func (proc *Proc) executeCC(opts *ipc.ExecOpts, pa, pd *prog.Prog, stat Stat) {
 			log.Logf(4, "fuzzer detected detector failure='%v' when dealing non-determinism, quit", err)
 			return
 		}
-		trace, err = ctchecker.ParseTrace(dTracemem)
-		if err != nil {
-			log.Logf(4, "fuzzer can not parse detector trace failure='%v' when dealing non-determinism, quit", err)
-			log.Logf(4, "trace 0:\n%v", string(dTracemem[0][:ctchecker.BufTrailingZero(dTracemem[0])]))
-			return
-		}
-		if dCandTrace == nil {
-			dCandTrace = trace
-			proc.fuzzer.qmProxy.LoadSnapshot()
-			aTracemem, output, _, hanged, err = proc.aEnv.ExecCC(newOpts, pa, proc.fuzzer.index)
-			if err != nil {
-				log.Logf(4, "fuzzer detected attacker failure='%v', quit", err)
-				return
-			}
-			log.Logf(2, "attacker result hanged=%v: %s", hanged, output)
-			dTracemem, output, _, hanged, err = proc.dEnv.ExecCC(newOpts, pd, proc.fuzzer.index)
-			if err != nil {
-				log.Logf(4, "fuzzer detected detector failure='%v', quit", err)
-				return
-			}
-			log.Logf(2, "detector result hanged=%v: %s", hanged, output)
-			dTestTrace, err = ctchecker.ParseTrace(dTracemem)
+		if !traceEqual && !dCandTraceNDOk {
+			trace, err = ctchecker.ParseTrace(dTracemem)
 			if err != nil {
 				log.Logf(4, "%v", err)
 				return
 			}
-			equal, reason = ctchecker.ProgTraceNDEqual(dCandTrace, dTestTrace)
-			if !equal {
-				continue
-			} else {
-				log.Logf(4, "Equal! Early quit!")
+			nomatch, updated := ctchecker.ProgTraceNDUpdate(dCandTrace, trace)
+			if nomatch {
+				log.Logf(4, "trace does not match")
 				return
 			}
+			if !updated {
+				dCandTraceNDOk = true
+			}
 		}
-		nomatch, updated := ctchecker.ProgTraceNDUpdate(dCandTrace, trace)
-		if nomatch {
-			log.Logf(4, "trace does not match")
-			return
+		if !sigEqual && !dCandSigNDOk {
+			var tmpSig []uint32
+			for _, call := range pInfo.Calls {
+				tmpSig = append(tmpSig, call.Signal...)
+			}
+			tmpSig = append(tmpSig, pInfo.Extra.Signal...)
+			tmpSig = ctchecker.RawSigIntersection(dCandRawSig, tmpSig)
+			if len(tmpSig) == len(dCandRawSig) {
+				// Successfully filter non-deterministic signals
+				dCandSigNDOk = true
+			}
+			dCandRawSig = tmpSig
 		}
-		if !updated {
+		if (traceEqual != dCandTraceNDOk) && (sigEqual != dCandSigNDOk) {
 			break
 		}
 	}
-	dett := dCandTrace.DeterminSerialze()
-	log.Logf(4, "DETERMINISM trace:\n%v\n", string(dett))
 
-	equal, reason = ctchecker.ProgTraceNDEqual(dCandTrace, dTestTrace)
-	if equal {
+	if !traceEqual {
+		traceEqual, reason = ctchecker.ProgTraceNDEqual(dCandTrace, dTestTrace)
+	}
+	if !sigEqual {
+
+		log.Logf(0, "After minimization:")
+		newIFSig = ctchecker.GenIFSigal(dCandRawSig, dTestRawSig)
+		log.Logf(0, "Number of ifsig: %v", len(ifSig))
+		log.Logf(0, "IFSIG: %v", ifSig)
+		proc.fuzzer.ifSignalMu.RLock()
+		sigEqual = !proc.fuzzer.detIFSignalSet.CheckNew(newIFSig)
+		proc.fuzzer.ifSignalMu.RUnlock()
+	}
+
+	if traceEqual && sigEqual {
+		log.Logf(4, "False positive!")
 		return
 	}
-	// send program & trace to manager
-	var atrace *ctchecker.ProgTrace
-	atrace, err = ctchecker.ParseTrace(aTracemem)
-	if err != nil {
-		log.Logf(4, "fuzzer can not compare attacker trace failure='%v' when sending report, quit", err)
-		return
+
+	proc.fuzzer.ifSignalMu.Lock()
+	proc.fuzzer.ifSigCnt = proc.fuzzer.detIFSignalSet.Merge(newIFSig, proc.fuzzer.ifSigCnt)
+	proc.fuzzer.ifSignalMu.Unlock()
+
+	if !sigEqual {
+		r := &rpctype.IFSigReportArgs{
+			Name: proc.fuzzer.name,
+			IFSigReport: rpctype.IFSigReport{
+				Sig: newIFSig,
+			},
+		}
+		if err := proc.fuzzer.manager.Call("Manager.NewIFSigReport", r, nil); err != nil {
+			log.Fatalf("Manager.NewIFSigReport call failed: %v", err)
+		}
 	}
-	r := &rpctype.CCReportArgs{
-		Name: proc.fuzzer.name,
-		CCReport: rpctype.CCReport{
-			AProg:         pa.Serialize(),
-			DProg:         pd.Serialize(),
-			ATrace:        atrace.RawSerialze(),
-			DTraceCandRaw: dCandTrace.RawSerialze(),
-			DTraceCandDet: dCandTrace.DeterminSerialze(),
-			DTraceTestRaw: dTestTrace.RawSerialze(),
-			Reason:        reason,
-		},
-	}
-	if err := proc.fuzzer.manager.Call("Manager.NewCCReport", r, nil); err != nil {
-		log.Fatalf("Manager.NewCCReport call failed: %v", err)
+
+	if !traceEqual {
+
+		dett := dCandTrace.DeterminSerialze()
+		log.Logf(4, "DETERMINISM trace:\n%v\n", string(dett))
+
+		r := &rpctype.CCReportArgs{
+			Name: proc.fuzzer.name,
+			CCReport: rpctype.CCReport{
+				AProg:         pa.Serialize(),
+				DProg:         pd.Serialize(),
+				ATrace:        atrace.RawSerialze(),
+				DTraceCandRaw: dCandTrace.RawSerialze(),
+				DTraceCandDet: dCandTrace.DeterminSerialze(),
+				DTraceTestRaw: dTestTrace.RawSerialze(),
+				Reason:        reason,
+				EnvFlags:      uint64(proc.fuzzer.config.Flags),
+				ExecFlags:     uint64(newOpts.Flags),
+				FaultCall:     newOpts.FaultCall,
+				FaultNth:      newOpts.FaultNth,
+			},
+		}
+		if err := proc.fuzzer.manager.Call("Manager.NewCCReport", r, nil); err != nil {
+			log.Fatalf("Manager.NewCCReport call failed: %v", err)
+		}
 	}
 	return
 
